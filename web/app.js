@@ -1,7 +1,7 @@
 /* LifeOS 前端 — 原生 JavaScript，不需要編譯 */
 'use strict';
 
-const APP_VERSION = '2.4.0';
+const APP_VERSION = '2.5.0';
 const ENTITIES = ['Transactions', 'Tasks', 'Events', 'Routines', 'RoutineLogs', 'Notes', 'Bills', 'Quick'];
 
 // 選項來自原本的記帳小程序；清單只是建議，輸入框仍可打清單以外的新值
@@ -49,7 +49,7 @@ const REPEAT_OPTS = [['', '不重複'], ['daily', '每天'], ['weekly', '每週'
 const REPEAT_LABEL = Object.fromEntries(REPEAT_OPTS);
 const MOODS = [['', '—'], ['😄', '😄 很好'], ['🙂', '🙂 不錯'], ['😐', '😐 普通'], ['😔', '😔 低落'], ['😫', '😫 很累']];
 const DOW = ['日', '一', '二', '三', '四', '五', '六'];
-const TITLES = { import: '匯入截圖', today: '今天', money: '記帳', tasks: '待辦', calendar: '行事曆', routines: '習慣', notes: '筆記', settings: '設定', reconcile: '月初對帳' };
+const TITLES = { import: '匯入明細', today: '今天', money: '記帳', tasks: '待辦', calendar: '行事曆', routines: '習慣', notes: '筆記', settings: '設定', reconcile: '月初對帳' };
 
 /* ───────── 狀態 ───────── */
 const S = {
@@ -1087,7 +1087,7 @@ function moneyReports() {
 }
 
 function moneyList() {
-  const importBtn = '<button class="btn secondary import-entry" data-act="openImport">📷 匯入刷卡／電子支付截圖</button>';
+  const importBtn = '<button class="btn secondary import-entry" data-act="openImport">📷 匯入截圖／📋 貼上明細</button>';
   return importBtn + moneyListBody();
 }
 function moneyListBody() {
@@ -1663,7 +1663,7 @@ const WALLETS = ['line pay', 'IPass money', '支付寶'];
 const BANK_ALIASES = [['國泰世華', '國泰'], ['國泰', '國泰'], ['台新', '台新'], ['富邦', '富邦'], ['聯邦', '聯邦'], ['中國信託', '中信'], ['中信', '中信'],
 ['玉山', '玉山'], ['第一', '第一'], ['永豐', '永豐'], ['上海', '上海'], ['安泰', '安泰'], ['王道', '王道']];
 const REBATE_CAT = '刷卡回饋';
-const IMP = { batches: [], account: localStorage.getItem('lifeos.impAccount') || '' };
+const IMP = { batches: [], account: localStorage.getItem('lifeos.impAccount') || '', mode: 'image', text: '' };
 
 function isWallet(a) { return WALLETS.includes(String(a || '').trim()); }
 function bankShort(name) {
@@ -1728,6 +1728,85 @@ function guessAccountByHistory(items) {
   return { account: best[0], reason: `你已記的 ${md(t.date)}「${stripShared(t.note) || t.category}」${money(t.amount)} 是用${best[0]}` };
 }
 
+// 類別：先看你以前同樣內容記成什麼，再用關鍵字猜
+const CAT_KEYWORDS = [
+  [/超商|7-?11|統一超|全家|萊爾富|OK mart|ＯＫ|麥當勞|摩斯|肯德基|早餐|便當|餐廳|食堂|雞蛋糕|小吃|Uber ?Eats|foodpanda|熊貓/i, '餐食'],
+  [/飲料|咖啡|星巴克|cama|路易莎|茶|50嵐|清心|可不可|麻古/i, '飲料'],
+  [/捷運|乘車|台鐵|高鐵|客運|公車|悠遊|uber|優步|計程|加油|中油|台塑石油|停車|ETC|遠通/i, '交通'],
+  [/蝦皮|好市多|costco|全聯|家樂福|大買家|酷澎|coupang|momo|pchome|淘寶|IKEA|寶雅|屈臣氏|康是美|大創|水電|瓦斯|電信|網路費/i, '家用'],
+  [/netflix|spotify|nintendo|steam|apple|google play|youtube|disney|影城|威秀|KKBOX|遊戲/i, '娛樂'],
+  [/uniqlo|\bgu\b|zara|h&m|net\b|服飾|鞋/i, '服飾'],
+  [/保險|人壽|產險/i, '保險'],
+  [/醫院|診所|藥局|牙醫|醫療/i, '醫療'],
+  [/課程|書店|博客來|誠品|hahow|udemy|openai|chatgpt/i, '課程'],
+  [/客路|klook|kkday|agoda|booking|airbnb|航空|飯店|旅行/i, '旅遊'],
+];
+function guessCategory(note, type, fallback) {
+  const name = stripShared(note);
+  const hist = S.data.Transactions.filter(t => t.type === type && stripShared(t.note) === name && t.category && t.category !== TRANSFER_CAT)
+    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))[0];
+  if (hist) return hist.category;
+  if (type === 'expense') { const k = CAT_KEYWORDS.find(([re]) => re.test(name)); if (k) return k[1]; }
+  return fallback || '其他';
+}
+
+/* 本機解析貼上的文字：一行一筆（日期、商家、金額），也支援「日期單獨一行、下面接交易」 */
+const RE_DATE = /(?:^|[^\d])(?:(\d{4})\s*[\/\.\-年]\s*)?(\d{1,2})\s*[\/\.\-月]\s*(\d{1,2})日?(?![\d\/])/;
+const RE_TIME = /\b\d{1,2}:\d{2}(?::\d{2})?\b/g;
+// 找第一個合理的日期（月 1–12、日 1–31），避免把 460.00 這類金額當成日期
+function findDate(str) {
+  const re = new RegExp(RE_DATE.source, 'g');
+  let m;
+  while ((m = re.exec(str))) {
+    if (Number(m[2]) >= 1 && Number(m[2]) <= 12 && Number(m[3]) >= 1 && Number(m[3]) <= 31) return m;
+    re.lastIndex = m.index + 1;
+  }
+  return null;
+}
+function localParse(text) {
+  const lines = String(text || '').split(/\r?\n/).map(l => l.replace(/　/g, ' ').trim()).filter(Boolean);
+  const anyPlus = lines.some(l => /(^|\s)[+＋]\s*(NT\$|\$|＄)?\s*\d/.test(l));
+  let carry = null;
+  const items = [];
+  let meaningful = 0;
+  lines.forEach(raw => {
+    // 「餘額 NT$ 143」是帳戶餘額，不是交易金額，先拿掉；帳單摘要（合計、應繳…）整行略過
+    const line = raw.replace(/餘額\s*[:：]?\s*(NT\$|NTD|\$|＄)?\s*-?[\d,]+(\.\d+)?/g, ' ').trim();
+    if (!line) return;
+    if (/小計|合計|總計|應繳|本期|上期|最低應繳|信用額度/.test(line)) return;
+    let rest = ' ' + line + ' ';
+    const dm = findDate(rest);
+    if (dm) rest = rest.replace(dm[0], dm[0][0].match(/\d/) ? ' ' : dm[0][0] + ' ');
+    rest = rest.replace(RE_TIME, ' ');
+    // 金額：有貨幣符號的優先；否則取最後一個獨立的數字
+    const amtRe = /([+\-－−＋]?)\s*(NT\$|NTD|TWD|＄|\$)?\s*([+\-－−]?)(?<![A-Za-z0-9.])(\d{1,3}(?:,\d{3})+|\d+)(\.\d{1,2})?(?![A-Za-z0-9])\s*(元|TWD)?/g;
+    const nums = [...rest.matchAll(amtRe)].filter(m => m[4]);
+    if (!nums.length) { if (dm && rest.trim().length < 6) carry = dm; return; }
+    meaningful++;
+    const pick = nums.filter(m => m[2] || m[6]).pop() || nums[nums.length - 1];
+    const sign = (pick[1] || pick[3] || '').replace(/[－−]/, '-').replace('＋', '+');
+    const amount = Number((pick[4] + (pick[5] || '')).replace(/,/g, ''));
+    const date = dm || carry;
+    let merchant = rest.replace(pick[0], ' ').replace(/[>›＞]\s*$/, '').replace(/\s+/g, ' ').replace(/^[\s\-－|,，:：]+|[\s\-－|,，:：]+$/g, '').trim();
+    if (!date || !merchant || !(amount > 0)) return;
+    let direction = 'expense';
+    if (/手續費|服務費/.test(merchant)) direction = 'fee';
+    else if (/回饋|退款|退貨|折抵/.test(merchant) || (!anyPlus && sign === '-')) direction = 'refund';
+    else if (/儲值/.test(merchant) && (sign === '+' || !anyPlus)) direction = 'topup';
+    else if (anyPlus && sign === '+') direction = 'income';
+    items.push({
+      year: date[1] ? Number(date[1]) : null, month: Number(date[2]), day: Number(date[3]), merchant, amount, direction,
+      counterparty: direction === 'topup' ? merchant : null, category: '', installment: null, truncated: /…|\.\.\.$/.test(merchant)
+    });
+  });
+  const t = String(text || '');
+  const l4 = t.match(/末四碼\s*[:：]?\s*(\d{4})/);
+  const src = { kind: 'unknown', issuer: null, appTitle: null, last4: l4 ? l4[1] : null, evidence: '貼上的文字（手機上直接解析）' };
+  if (/line\s*pay/i.test(t)) Object.assign(src, { kind: 'e_wallet', issuer: 'LINE Pay', evidence: '文字中有「LINE Pay」' });
+  else if (/ipass/i.test(t)) Object.assign(src, { kind: 'e_wallet', issuer: 'iPASS MONEY', evidence: '文字中有「iPASS」' });
+  return { source: src, items, meaningful };
+}
+
 function buildItems(batch) {
   const isCardAcct = isCard(batch.account);
   return (batch.raw.items || []).map(r => {
@@ -1736,7 +1815,8 @@ function buildItems(batch) {
     if (r.installment) note += '（' + r.installment + '）';
     const it = { date, note, amount: Math.abs(Number(r.amount) || 0), shared: false, raw: r, truncated: !!r.truncated, yearGuessed: !r.year && !!date };
     const cats = r.direction === 'income' || r.direction === 'refund' ? INCOME_CATS : EXPENSE_CATS;
-    const cat = cats.includes(r.category) ? r.category : '其他';
+    const isIn = r.direction === 'income' || r.direction === 'refund';
+    const cat = guessCategory(note, isIn ? 'income' : 'expense', cats.includes(r.category) ? r.category : '其他');
     switch (r.direction) {
       case 'topup':
         Object.assign(it, { type: 'transfer', from: bankToAccount(r.counterparty), to: batch.account, category: TRANSFER_CAT });
@@ -1800,6 +1880,43 @@ function compressImage(file) {
   });
 }
 
+async function handleImportText() {
+  const text = IMP.text.trim();
+  if (!text) { toast('請先貼上交易紀錄', true); return; }
+  const batch = { id: uid(), name: '貼上的文字', status: 'loading', chosen: IMP.account, items: [] };
+  IMP.batches.unshift(batch);
+  renderImport();
+  const local = localParse(text);
+  // 大部分有數字的行都解析成功 → 直接用本機結果；否則交給 Gemini
+  const goodLocal = local.items.length && local.items.length / Math.max(1, local.meaningful) >= 0.7;
+  try {
+    if (goodLocal) {
+      batch.raw = local; batch.engine = '手機直接解析';
+    } else {
+      try {
+        const res = await api({
+          action: 'parseStatement', name: 'pasted-text', text,
+          hint: { today: today(), expenseCats: uniq(EXPENSE_CATS.concat(['貸款'])), incomeCats: INCOME_CATS.concat([REBATE_CAT]) }
+        });
+        batch.raw = res.data; batch.engine = 'Gemini 辨識';
+      } catch (err) {
+        if (!local.items.length) throw err;
+        batch.raw = local; batch.engine = '手機直接解析';
+        batch.warn = `Gemini 無法使用（${err.message}），改用手機直接解析，只抓到 ${local.items.length} 筆，請仔細核對`;
+      }
+    }
+    resolveAccount(batch);
+    batch.items = buildItems(batch);
+    refreshDups(batch);
+    batch.status = 'done';
+    IMP.text = '';
+  } catch (err) {
+    batch.status = 'error';
+    batch.error = err.network ? '這段文字格式比較複雜，需要網路用 Gemini 辨識' : err.message;
+  }
+  renderImport();
+}
+
 async function handleImportFiles(files) {
   const chosen = IMP.account;
   const list = Array.from(files || []);
@@ -1815,7 +1932,7 @@ async function handleImportFiles(files) {
         action: 'parseStatement', name: f.name, image: img.base64, mimeType: 'image/jpeg',
         hint: { today: today(), expenseCats: uniq(EXPENSE_CATS.concat(['貸款'])), incomeCats: INCOME_CATS.concat([REBATE_CAT]) }
       });
-      batch.raw = res.data;
+      batch.raw = res.data; batch.engine = 'Gemini 辨識';
       resolveAccount(batch);
       batch.items = buildItems(batch);
       refreshDups(batch);
@@ -1862,7 +1979,7 @@ function importRow(b, it, i) {
 }
 
 function importBatchCard(b) {
-  if (b.status === 'loading') return `<div class="card imp-batch"><div class="imp-head">${b.thumb ? `<img src="${b.thumb}" alt="">` : ''}<div><b>${esc(b.name)}</b><div class="help">辨識中…（約 5–20 秒）</div></div></div></div>`;
+  if (b.status === 'loading') return `<div class="card imp-batch"><div class="imp-head">${b.thumb ? `<img src="${b.thumb}" alt="">` : ''}<div><b>${esc(b.name)}</b><div class="help">辨識中…</div></div></div></div>`;
   if (b.status === 'error') return `<div class="card imp-batch"><div class="imp-head">${b.thumb ? `<img src="${b.thumb}" alt="">` : ''}<div><b>${esc(b.name)}</b>
     <div class="alert warn" style="margin:6px 0 0">${esc(b.error)}</div></div></div><button class="btn danger" data-act="impRemove" data-b="${b.id}">移除</button></div>`;
   const src = b.raw.source || {};
@@ -1870,7 +1987,7 @@ function importBatchCard(b) {
   return `<div class="card imp-batch">
     <div class="imp-head">${b.thumb ? `<img src="${b.thumb}" alt="">` : ''}
       <div style="flex:1;min-width:0">
-        <b>${esc(b.name)}</b> <span class="muted">· ${b.items.length} 筆${src.last4 ? ' · 末四碼 ' + esc(src.last4) : ''}</span>
+        <b>${esc(b.name)}</b> <span class="muted">· ${b.items.length} 筆${src.last4 ? ' · 末四碼 ' + esc(src.last4) : ''}${b.engine ? ' · ' + b.engine : ''}</span>
         <div class="field" style="margin:6px 0 0"><label>帳戶${b.account ? '' : '（請選擇）'}</label>${accountSelect('', b.account, `class="imp-acct ${b.account ? '' : 'missing'}" data-b="${b.id}"`)}</div>
         ${b.reason ? `<div class="help">${b.guessed ? '🔎 ' : '✓ '}${esc(b.reason)}</div>` : ''}
         ${b.warn ? `<div class="alert warn" style="margin:6px 0 0">${esc(b.warn)}</div>` : ''}
@@ -1885,10 +2002,18 @@ VIEWS.import = function () {
   return `
     <div class="toolbar"><button class="chip" data-act="impBack">‹ 返回記帳</button></div>
     <div class="card">
-      <div class="field"><label>① 這是哪個帳戶的截圖？</label>${accountSelect('impAccount', IMP.account)}</div>
+      <div class="seg" style="margin-bottom:12px">
+        <button class="${IMP.mode === 'image' ? 'on' : ''}" data-act="impMode" data-v="image">📷 截圖</button>
+        <button class="${IMP.mode === 'text' ? 'on' : ''}" data-act="impMode" data-v="text">📋 貼上文字</button>
+      </div>
+      <div class="field"><label>① 這是哪個帳戶的${IMP.mode === 'text' ? '紀錄' : '截圖'}？</label>${accountSelect('impAccount', IMP.account)}</div>
+      ${IMP.mode === 'image' ? `
       <label class="btn" for="impFile" style="display:block;text-align:center">② 選擇截圖（可一次選多張）</label>
-      <input id="impFile" type="file" accept="image/*" multiple hidden>
-      <p class="help">Gemini 會讀出每一筆的日期、商家、金額。匯入前你可以修改、取消勾選；已經記過的會自動標出來並預設不勾。刷卡回饋會記成這張卡的「${REBATE_CAT}」，自動從卡費扣掉；電子錢包的儲值會記成轉帳。</p>
+      <input id="impFile" type="file" accept="image/*" multiple hidden>` : `
+      <div class="field"><label>② 貼上交易紀錄（從網銀、App、Excel 或帳單 Email 複製）</label>
+        <textarea id="impText" class="tall" placeholder="例如：&#10;11/03 NETFLIX.COM NT$460&#10;11/05 樂購蝦皮－愛家寢飾 NT$320&#10;2026/11/15 刷卡現金回饋 -17">${esc(IMP.text)}</textarea></div>
+      <button class="btn" data-act="impParseText">解析</button>`}
+      <p class="help">${IMP.mode === 'text' ? '一行一筆（有日期和金額）的格式會直接在手機上解析；排版比較亂的（例如一筆分成好幾行）會交給 Gemini 讀。' : 'Gemini 會讀出每一筆的日期、商家、金額。'}匯入前你可以修改、取消勾選；已經記過的會自動標出來並預設不勾。刷卡回饋會記成這張卡的「${REBATE_CAT}」，自動從卡費扣掉；電子錢包的儲值會記成轉帳。</p>
     </div>
     <datalist id="impCats_expense">${EXPENSE_CATS.map(c => `<option value="${esc(c)}">`).join('')}</datalist>
     <datalist id="impCats_income">${uniq(INCOME_CATS.concat([REBATE_CAT])).map(c => `<option value="${esc(c)}">`).join('')}</datalist>
@@ -1936,6 +2061,8 @@ Object.assign(ACTIONS, {
   impBack: () => { S.moneyMode = 'list'; go('money'); },
   impRemove: el => { IMP.batches = IMP.batches.filter(b => b.id !== el.dataset.b); render(); },
   impCommit: () => commitImport(),
+  impMode: el => { IMP.mode = el.dataset.v; render(); },
+  impParseText: () => handleImportText(),
 });
 document.addEventListener('change', e => {
   const el = e.target;
@@ -1959,6 +2086,7 @@ document.addEventListener('change', e => {
     render();
   }
 });
+document.addEventListener('input', e => { if (e.target.id === 'impText') IMP.text = e.target.value; });
 document.addEventListener('input', e => { if (e.target.classList.contains('imp-f') && !['sel', 'type', 'shared'].includes(e.target.dataset.f)) impField(e.target); });
 function impField(el) {
   const b = IMP.batches.find(x => x.id === el.dataset.b);

@@ -1295,3 +1295,16 @@ button {
 .imp-line.sub {
   margin-top: 5px;
 }
+
+#impText {
+  width: 100%;
+  min-height: 160px;
+  padding: 11px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.6;
+}
