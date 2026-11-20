@@ -1,8 +1,8 @@
 /* LifeOS 前端 — 原生 JavaScript，不需要編譯 */
 'use strict';
 
-const APP_VERSION = '2.0.0';
-const ENTITIES = ['Transactions', 'Tasks', 'Events', 'Routines', 'RoutineLogs', 'Notes'];
+const APP_VERSION = '2.2.0';
+const ENTITIES = ['Transactions', 'Tasks', 'Events', 'Routines', 'RoutineLogs', 'Notes', 'Bills'];
 
 // 選項來自原本的記帳小程序；清單只是建議，輸入框仍可打清單以外的新值
 const EXPENSE_CATS = ['餐食', '飲料', '交通', '家用', '服飾', '保養品', '課程', '娛樂', '醫療', '保險', '固定開銷',
@@ -20,6 +20,22 @@ const BANKS = ['現金', '富邦帳戶', '國泰帳戶', '中信帳戶', '台新
 
 // 記帳「總覽」與「今天」的收支統計不列入這些類別（明細仍會顯示）。想排除更多就加在這裡。
 const DASH_EXCLUDE = ['帳戶互轉'];
+
+// 報表：支付方式名稱含這段文字的視為信用卡（不算在帳戶餘額，改列在信用卡費）
+const CARD_RE = /信用卡/;
+// 報表：收入類別以「餘額」結尾的視為當月 1 號的期初餘額
+const OPENING_RE = /餘額\s*$/;
+
+// 「建立固定扣款」按鈕會建立的預設項目（之後都可以在 App 裡修改）
+const BILL_SEED = [
+  { name: '富邦卡費', kind: 'card', card: '富邦信用卡', payAccount: '富邦帳戶', closeDay: 20, dueDay: 5, dueOffset: 1, category: '卡費', recordNote: '富邦卡費' },
+  { name: '台新卡費', kind: 'card', card: '台新信用卡', payAccount: '台新帳戶', closeDay: 7, dueDay: 23, dueOffset: 0, category: '卡費', recordNote: '台新卡費' },
+  { name: '聯邦卡費', kind: 'card', card: '聯邦信用卡', payAccount: '聯邦帳戶', closeDay: 12, dueDay: 27, dueOffset: 0, category: '卡費', recordNote: '聯邦卡費' },
+  { name: '國泰卡費', kind: 'card', card: '國泰信用卡', payAccount: '國泰帳戶', closeDay: 8, dueDay: 24, dueOffset: 0, category: '卡費', recordNote: '國泰卡費' },
+  { name: '富邦學貸', kind: 'fixed', payAccount: '富邦帳戶', dueDay: 1, amount: 4811, category: '貸款', recordNote: '學貸' },
+  { name: '第一學貸', kind: 'fixed', payAccount: '第一帳戶', dueDay: 1, amount: 1600, category: '貸款', recordNote: '學貸' },
+  { name: '第一房貸', kind: 'fixed', payAccount: '第一帳戶', dueDay: 11, amount: 16535, category: '貸款', recordNote: '信貸' },
+];
 
 // 「共同」：勾選時在備註後面加上這段文字（沿用原本記帳程序的規則）
 const SHARED_SUFFIX = '(共同)';
@@ -417,6 +433,7 @@ const VIEWS = {
         ${list(routines.map(r => routineItem(r, t)), '今天沒有排定的例行公事')}</div>
       <div class="card"><h3>待辦（今天與逾期）<a data-act="go" data-view="tasks">全部 ›</a></h3>
         ${list(tasks.slice(0, 8).map(taskItem), '都完成了 🎉')}</div>
+      ${todayBills()}
       <div class="card"><h3>本月收支 <a data-act="goMoney">總覽 ›</a></h3>
         <div class="stats">
           <div class="stat" style="padding:0"><div class="label">今日支出</div><div class="value expense">${money(todayExp)}</div></div>
@@ -426,16 +443,14 @@ const VIEWS = {
   },
 
   money() {
-    const dash = S.moneyMode === 'dash';
+    const mode = S.moneyMode;
+    const seg = (v, label) => `<button class="${mode === v ? 'on' : ''}" data-act="moneyMode" data-v="${v}">${label}</button>`;
     return `
       <div class="toolbar">
-        <div class="seg">
-          <button class="${dash ? 'on' : ''}" data-act="moneyMode" data-v="dash">總覽</button>
-          <button class="${dash ? '' : 'on'}" data-act="moneyMode" data-v="list">明細</button>
-        </div>
+        <div class="seg">${seg('dash', '總覽')}${seg('report', '報表')}${seg('bills', '扣款')}${seg('list', '明細')}</div>
         ${monthNav('moneyMonth', S.moneyMonth)}
       </div>
-      ${dash ? moneyDashboard() : moneyList()}`;
+      ${mode === 'dash' ? moneyDashboard() : mode === 'report' ? moneyReports() : mode === 'bills' ? moneyBills() : moneyList()}`;
   },
 
   tasks() {
@@ -478,7 +493,8 @@ const VIEWS = {
       if (i >= 35 && !inMonth) break;
       const ev = S.data.Events.filter(e => occursOn(e, d)).length;
       const tk = S.data.Tasks.filter(x => !x.done && x.due === d).length;
-      const dots = '<i></i>'.repeat(Math.min(ev, 3)) + (tk ? '<i class="t"></i>' : '');
+      const bl = activeBills().filter(b => dayIn(d.slice(0, 7), b.dueDay) === d).length;
+      const dots = '<i></i>'.repeat(Math.min(ev, 3)) + (tk ? '<i class="t"></i>' : '') + (bl ? '<i class="b"></i>' : '');
       cells.push(`<button class="day ${inMonth ? '' : 'other'} ${d === t ? 'today' : ''} ${d === S.calSel ? 'sel' : ''}" data-act="calSel" data-d="${d}">
         ${parseYmd(d).getDate()}<span class="dots">${dots}</span></button>`);
     }
@@ -489,7 +505,8 @@ const VIEWS = {
         <button class="chip" data-act="calToday">今天</button></div>
       <div class="card"><div class="cal">${DOW.map(d => `<div class="dow">${d}</div>`).join('')}${cells.join('')}</div></div>
       <div class="card"><h3>${dateLabel(sel)} 的行程</h3>${list(eventsOn(sel).map(eventItem), '沒有行程')}</div>
-      ${dueTasks.length ? `<div class="card"><h3>當天到期的待辦</h3>${list(dueTasks.map(taskItem), '')}</div>` : ''}`;
+      ${dueTasks.length ? `<div class="card"><h3>當天到期的待辦</h3>${list(dueTasks.map(taskItem), '')}</div>` : ''}
+      ${calendarBills(sel)}`;
   },
 
   routines() {
@@ -551,6 +568,34 @@ const VIEWS = {
   },
 };
 
+// 今天頁：7 天內（含已過期未記帳）的扣款，與帳戶不足提醒
+function todayBills() {
+  if (!activeBills().length) return '';
+  const t = today(), ym = t.slice(0, 7), until = addDays(t, 7);
+  let infos = billsInMonth(ym);
+  if (until.slice(0, 7) !== ym) infos = infos.concat(billsInMonth(until.slice(0, 7)));
+  const soon = infos.filter(i => !i.paid && i.due <= until);
+  const short = accountReadiness(ym).filter(r => r.after < 0);
+  if (!soon.length && !short.length) return '';
+  return `<div class="card"><h3>即將扣款 <a data-act="goBills">扣款總覽 ›</a></h3>
+    ${short.length ? shortfallBanner(accountReadiness(ym)) : ''}
+    ${list(soon.map(i => billRow(i)), '7 天內沒有扣款')}</div>`;
+}
+
+function calendarBills(date) {
+  const ym = date.slice(0, 7);
+  const dues = billsInMonth(ym).filter(i => i.due === date);
+  const closes = activeBills().filter(b => b.kind === 'card' && dayIn(ym, b.closeDay) === date);
+  if (!dues.length && !closes.length) return '';
+  const closeRows = closes.map(b => {
+    const dueYm = addMonths(ym, Number(b.dueOffset) || 0);
+    const i = billInfo(b, dueYm);
+    return `<li class="item"><div class="time-col">結帳</div><div class="main" data-act="billDetail" data-id="${b.id}" data-ym="${dueYm}">
+      <div class="title">${esc(b.card)} 結帳日</div><div class="sub">本期已刷 ${money(i.estimate)} · ${md(i.due)} 從${esc(b.payAccount)}扣款</div></div></li>`;
+  });
+  return `<div class="card"><h3>扣款與結帳 <a data-act="goBills">扣款總覽 ›</a></h3>${list(dues.map(i => billRow(i, false)).concat(closeRows), '')}</div>`;
+}
+
 function moneyDashboard() {
   const m = S.moneyMonth;
   const all = monthTx(m);
@@ -610,6 +655,308 @@ function moneyDashboard() {
     ${excludedN ? `<p class="help" style="text-align:center">總覽不含「${DASH_EXCLUDE.join('、')}」${excludedN} 筆，可在明細查看</p>` : ''}`;
 }
 
+/* ───────── 固定扣款 ───────── */
+function md(date) { return Number(date.slice(5, 7)) + '/' + Number(date.slice(8, 10)); }
+function dayIn(ym, day) { const [y, m] = ym.split('-').map(Number); return ym + '-' + pad(Math.min(Math.max(1, Number(day) || 1), daysInMonth(y, m))); }
+function activeBills() {
+  return S.data.Bills.filter(b => b.active !== false)
+    .sort((a, b) => (Number(a.sort) || 0) - (Number(b.sort) || 0) || String(a.createdAt).localeCompare(String(b.createdAt)));
+}
+// 在 ym 這個月扣款的那期信用卡帳單，涵蓋哪段刷卡期間
+function billCycle(b, ym) {
+  const closeYm = addMonths(ym, -(Number(b.dueOffset) || 0));
+  return { start: addDays(dayIn(addMonths(closeYm, -1), b.closeDay), 1), end: dayIn(closeYm, b.closeDay) };
+}
+function parseOverrides(b) { try { return JSON.parse(b.overrides || '{}') || {}; } catch (e) { return {}; } }
+function billNote(b) { return String(b.recordNote || b.name).trim(); }
+// 某個固定扣款在 ym 月的狀態
+function billInfo(b, ym) {
+  const due = dayIn(ym, b.dueDay);
+  const paidTx = S.data.Transactions.filter(t => t.type === 'expense' && String(t.date).slice(0, 7) === ym
+    && String(t.account || '').trim() === b.payAccount && stripShared(t.note) === billNote(b));
+  const ov = parseOverrides(b)[ym];
+  const hasOv = ov !== undefined && ov !== null && ov !== '';
+  let cycle = null, swipes = [], estimate = 0, closed = false;
+  if (b.kind === 'card') {
+    cycle = billCycle(b, ym);
+    swipes = S.data.Transactions.filter(t => t.type === 'expense' && String(t.account || '').trim() === b.card && t.date >= cycle.start && t.date <= cycle.end);
+    estimate = sum(swipes);
+    closed = today() > cycle.end;
+  }
+  const planned = hasOv ? Number(ov) : b.kind === 'card' ? estimate : Number(b.amount) || 0;
+  const paid = paidTx.length > 0;
+  return { bill: b, ym, due, paid, paidTx, paidAmt: sum(paidTx), planned, amount: paid ? sum(paidTx) : planned,
+    hasOv, cycle, swipes, estimate, closed, overdue: !paid && due < today() };
+}
+function billsInMonth(ym) { return activeBills().map(b => billInfo(b, ym)).sort((a, b) => a.due.localeCompare(b.due)); }
+function billStatusText(i) {
+  if (i.paid) return '已扣款';
+  if (i.overdue) return '已過扣款日・尚未記帳';
+  if (i.bill.kind === 'card') return i.hasOv ? '帳單金額' : i.closed ? '已結帳・請填帳單金額' : '預估（尚未結帳）';
+  return '固定金額';
+}
+// 帳戶在 ym 月的餘額（和「帳戶餘額」報表相同）；這個月還沒登記期初餘額時，接續上個月的結餘
+function acctBalance(ym, acct) {
+  const tx = monthTx(ym).filter(t => String(t.account || '').trim() === acct);
+  let bal = tx.reduce((s, t) => s + signed(t), 0);
+  if (!tx.some(t => t.type === 'income' && OPENING_RE.test(String(t.category || '')))) {
+    bal += monthTx(addMonths(ym, -1)).filter(t => String(t.account || '').trim() === acct).reduce((s, t) => s + signed(t), 0);
+  }
+  return bal;
+}
+// 每個扣款帳戶：目前餘額、還沒扣的金額、扣完剩多少
+function accountReadiness(ym) {
+  const infos = billsInMonth(ym);
+  return uniq(infos.map(i => i.bill.payAccount)).sort(acctOrder).map(a => {
+    const items = infos.filter(i => i.bill.payAccount === a && !i.paid);
+    const pending = items.reduce((s, i) => s + i.amount, 0);
+    const bal = acctBalance(ym, a);
+    return { acct: a, bal, pending, after: bal - pending, items };
+  });
+}
+function billRow(i, showDate) {
+  return `<li class="item">
+    <div class="time-col">${showDate === false ? '' : md(i.due)}</div>
+    <div class="main" data-act="billDetail" data-id="${i.bill.id}" data-ym="${i.ym}">
+      <div class="title">${esc(i.bill.name)} ${i.paid ? '<span class="tag ok">✓ 已扣款</span>' : i.overdue ? '<span class="tag overdue">未記帳</span>' : ''}</div>
+      <div class="sub">${esc(i.bill.payAccount)} · ${billStatusText(i)}</div>
+    </div>
+    <div class="amount ${i.paid ? 'muted' : 'expense'}">${money(i.amount)}</div></li>`;
+}
+function shortfallBanner(ready) {
+  const short = ready.filter(r => r.after < 0);
+  if (!ready.length) return '';
+  return short.length
+    ? `<div class="alert warn">⚠️ ${short.map(r => `<b>${esc(r.acct)}</b> 還差 <b>${money(-r.after)}</b>`).join('、')}</div>`
+    : `<div class="alert ok">✅ 本月所有扣款帳戶餘額都足夠</div>`;
+}
+
+function moneyBills() {
+  const ym = S.moneyMonth;
+  if (!S.data.Bills.length) {
+    return `<div class="card"><h3>固定扣款</h3>
+      <p class="help">設定每月固定扣款後，App 會自動：<br>・在行事曆標出扣款日和信用卡結帳日<br>・用你的刷卡紀錄預估每期卡費<br>・比對明細，看哪些已經扣款<br>・算出每個扣款帳戶還差多少</p>
+      <div class="form-actions"><button class="btn" data-act="seedBills">一鍵建立 4 張信用卡＋3 筆貸款</button><button class="btn secondary" data-act="newBill">自己新增</button></div>
+      <p class="help">會建立：<br>${BILL_SEED.map(b => esc(b.name) + (b.kind === 'card'
+        ? `：每月 ${b.closeDay} 號結帳，${b.dueOffset ? '次月' : '當月'} ${b.dueDay} 號從${esc(b.payAccount)}扣款`
+        : `：每月 ${b.dueDay} 號從${esc(b.payAccount)}扣 ${money(b.amount)}`)).join('<br>')}</p></div>`;
+  }
+  const infos = billsInMonth(ym);
+  const ready = accountReadiness(ym);
+  const tot = k => ready.reduce((s, r) => s + r[k], 0);
+  const cards = activeBills().filter(b => b.kind === 'card');
+  return `
+    ${shortfallBanner(ready)}
+    <div class="card report"><h3>扣款帳戶準備金 <span>扣完剩 = 餘額 − 待扣</span></h3>
+      <table class="rtable">
+        <thead><tr><th>帳戶</th><th>目前餘額</th><th>待扣</th><th>扣完剩</th></tr></thead>
+        <tbody>${ready.map(r => `<tr><td>${esc(r.acct)}</td><td>${num(r.bal)}</td><td>${r.pending ? num(-r.pending) : '<span class="muted">0</span>'}</td><td class="${r.after < 0 ? 'short' : ''}">${num(r.after)}</td></tr>`).join('')}</tbody>
+        <tfoot><tr><td>總和</td><td>${num(tot('bal'))}</td><td>${num(-tot('pending'))}</td><td class="${tot('after') < 0 ? 'short' : ''}">${num(tot('after'))}</td></tr></tfoot>
+      </table></div>
+    <div class="card"><h3>${Number(ym.slice(5))} 月扣款 <span>${infos.filter(i => i.paid).length} / ${infos.length} 已扣</span></h3>
+      ${list(infos.map(i => billRow(i)), '這個月沒有扣款')}</div>
+    ${cards.length ? `<div class="card"><h3>信用卡本期 <span>點卡片看刷卡明細</span></h3>${list(cards.map(b => {
+      const nextDueYm = addMonths(ym, Number(b.dueOffset) || 0);
+      const i = billInfo(b, nextDueYm);
+      return `<li class="item"><div class="time-col">${md(i.cycle.end)}<br><small>結帳</small></div>
+        <div class="main" data-act="billDetail" data-id="${b.id}" data-ym="${nextDueYm}"><div class="title">${esc(b.card)}</div>
+        <div class="sub">${md(i.cycle.start)}–${md(i.cycle.end)} · ${md(i.due)} 扣款${i.closed ? ' · 已結帳' : ''}</div></div>
+        <div class="amount">${money(i.estimate)}</div></li>`;
+    }), '')}<p class="help">金額＝這期已記帳的刷卡合計。實際帳單可能包含沒記到的消費，收到帳單後點進去填實際金額。</p></div>` : ''}
+    <div class="card"><h3>固定扣款設定 <a data-act="newBill">＋ 新增</a></h3>${list(S.data.Bills.slice().sort((a, b) => (Number(a.sort) || 0) - (Number(b.sort) || 0)).map(b => `
+      <li class="item"><div class="main" data-act="editBill" data-id="${b.id}"><div class="title">${esc(b.name)}${b.active === false ? ' <span class="tag muted">暫停</span>' : ''}</div>
+      <div class="sub">${b.kind === 'card' ? `${esc(b.card)} · ${b.closeDay} 號結帳 · ${b.dueOffset ? '次月' : '當月'} ${b.dueDay} 號扣款` : `每月 ${b.dueDay} 號 · ${money(b.amount)}`} · ${esc(b.payAccount)}</div></div></li>`), '')}</div>`;
+}
+
+function saveOverride(b, ym, val) {
+  const o = parseOverrides(b);
+  if (val === '' || val === null || val === undefined) delete o[ym];
+  else o[ym] = Number(val);
+  const str = JSON.stringify(o);
+  if (str !== (b.overrides || '{}')) updateRec('Bills', b.id, { overrides: str });
+}
+
+function billDetail(id, ym) {
+  const b = find('Bills', id);
+  if (!b) return;
+  const i = billInfo(b, ym);
+  const lines = [];
+  if (b.kind === 'card') {
+    lines.push(`<b>帳單週期</b>：${md(i.cycle.start)} – ${md(i.cycle.end)}（${i.closed ? '已結帳' : '尚未結帳'}）`);
+    lines.push(`<b>這期刷卡紀錄</b>：${i.swipes.length} 筆，合計 ${money(i.estimate)}`);
+    i.swipes.sort((a, c) => a.date.localeCompare(c.date)).forEach(t => lines.push(`<span class="muted">・${md(t.date)} ${esc(stripShared(t.note) || t.category)} ${money(t.amount)}</span>`));
+  }
+  lines.push(`<b>扣款</b>：${dateLabel(i.due)} 從 ${esc(b.payAccount)}`);
+  if (i.paid) lines.push(`<b class="income">✓ 已記帳扣款 ${money(i.paidAmt)}</b>（${i.paidTx.map(t => md(t.date)).join('、')}）`);
+  else lines.push(`還沒找到這筆扣款的記帳（比對：${esc(b.payAccount)}、內容「${esc(billNote(b))}」）`);
+  openForm({
+    title: `${b.name}・${Number(ym.slice(5))} 月`,
+    values: { amount: i.hasOv ? i.planned : '' },
+    fields: [{ name: 'amount', type: 'number',
+      label: b.kind === 'card' ? `實際帳單金額（留空＝用刷卡合計 ${money(i.estimate)}）` : `本月金額（留空＝固定 ${money(b.amount)}）` }],
+    hint: lines.join('<br>'),
+    submitLabel: '儲存金額',
+    extra: [
+      i.paid
+        ? { label: '查看扣款紀錄', fn: () => { closeForm(); txForm(i.paidTx[0]); } }
+        : { label: '記為已扣款（新增一筆記帳）', primary: true, fn: v => {
+            const amt = v.amount !== '' ? Number(v.amount) : i.planned;
+            if (!(amt > 0)) throw new Error('請先填帳單金額');
+            saveOverride(b, ym, v.amount);
+            createRec('Transactions', { type: 'expense', amount: amt, category: b.category || (b.kind === 'card' ? '卡費' : '貸款'), date: i.due, account: b.payAccount, note: billNote(b) });
+            toast('已新增扣款記帳');
+          } },
+      { label: '修改這個固定扣款的設定', fn: () => { closeForm(); billForm(b); } },
+    ],
+    onSave: v => saveOverride(b, ym, v.amount),
+  });
+}
+
+function billForm(rec) {
+  const cardSuggest = () => uniq(PAY_METHODS.filter(isCard).concat(S.data.Transactions.map(t => t.account).filter(isCard)));
+  const acctSuggest = () => uniq(BANKS.concat(S.data.Transactions.map(t => t.account)).filter(a => !isCard(a)));
+  openForm({
+    title: rec ? '編輯固定扣款' : '新增固定扣款',
+    values: rec ? Object.assign({}, rec, { paused: rec.active === false }) : { kind: 'card', dueOffset: 0, category: '卡費', paused: false },
+    fields: [
+      { name: 'kind', label: '類型', type: 'select', options: [['card', '信用卡（金額依每期帳單）'], ['fixed', '固定金額（貸款、房租、保險…）']] },
+      { name: 'name', label: '名稱', placeholder: '例如：玉山卡費、中信房租' },
+      { name: 'card', label: '信用卡', suggest: cardSuggest, hidden: v => v.kind !== 'card' },
+      { type: 'row', hidden: v => v.kind !== 'card', fields: [
+        { name: 'closeDay', label: '每月結帳日', type: 'number', placeholder: '1–31' },
+        { name: 'dueOffset', label: '扣款月份', type: 'select', options: [[0, '結帳當月'], [1, '結帳次月']] },
+      ] },
+      { type: 'row', fields: [
+        { name: 'dueDay', label: '每月扣款日', type: 'number', placeholder: '1–31' },
+        { name: 'amount', label: '每月金額', type: 'number', hidden: v => v.kind !== 'fixed' },
+      ] },
+      { name: 'payAccount', label: '扣款帳戶', suggest: acctSuggest },
+      { type: 'row', fields: [
+        { name: 'category', label: '記帳類別', suggest: () => uniq(['卡費', '貸款', '固定開銷', '保險'].concat(EXPENSE_CATS)) },
+        { name: 'recordNote', label: '記帳內容', placeholder: '留空＝同名稱' },
+      ] },
+      { name: 'paused', label: '暫停（不再出現在行事曆和扣款）', type: 'checkbox', hidden: () => !rec },
+    ],
+    hint: '怎麼判斷「已扣款」：同一個月、同一個扣款帳戶、內容和「記帳內容」相同的支出，就算已扣款。日期超過該月天數時（例如 31 號），自動改成月底。',
+    onSave: v => {
+      const day = x => Math.round(Number(x));
+      if (!String(v.name || '').trim()) throw new Error('請輸入名稱');
+      if (!String(v.payAccount || '').trim()) throw new Error('請輸入扣款帳戶');
+      if (!(day(v.dueDay) >= 1 && day(v.dueDay) <= 31)) throw new Error('扣款日要在 1–31 之間');
+      const data = { name: v.name.trim(), kind: v.kind, payAccount: v.payAccount.trim(), dueDay: day(v.dueDay),
+        category: (v.category || '').trim(), recordNote: (v.recordNote || '').trim(), active: !v.paused };
+      if (v.kind === 'card') {
+        if (!String(v.card || '').trim()) throw new Error('請輸入信用卡');
+        if (!(day(v.closeDay) >= 1 && day(v.closeDay) <= 31)) throw new Error('結帳日要在 1–31 之間');
+        Object.assign(data, { card: v.card.trim(), closeDay: day(v.closeDay), dueOffset: Number(v.dueOffset) || 0, amount: 0 });
+      } else {
+        if (!(Number(v.amount) >= 0) || v.amount === '') throw new Error('請輸入每月金額');
+        Object.assign(data, { card: '', closeDay: '', dueOffset: 0, amount: Number(v.amount) });
+      }
+      if (rec) updateRec('Bills', rec.id, data);
+      else createRec('Bills', Object.assign(data, { overrides: '{}', sort: S.data.Bills.length }));
+    },
+    onDelete: rec && (() => removeRec('Bills', rec.id)),
+  });
+}
+
+/* ───────── 報表 ───────── */
+function signed(t) { return (t.type === 'income' ? 1 : -1) * Number(t.amount || 0); }
+function num(n) { n = Math.round(n); return (n < 0 ? '-' : '') + Math.abs(n).toLocaleString('zh-TW'); }
+function numCls(n) { return n < 0 ? 'expense' : n > 0 ? 'income' : 'muted'; }
+function isCard(acc) { return CARD_RE.test(String(acc || '')); }
+// 依 BANKS 清單順序排列帳戶，清單外的排後面
+function acctOrder(a, b) {
+  const ia = BANKS.indexOf(a), ib = BANKS.indexOf(b);
+  return (ia < 0 ? 999 : ia) - (ib < 0 ? 999 : ib) || a.localeCompare(b);
+}
+function accountBalances(m) {
+  const out = {};
+  monthTx(m).filter(t => !isCard(t.account)).forEach(t => {
+    const a = String(t.account || '').trim() || '（未填帳戶）';
+    out[a] = (out[a] || 0) + signed(t);
+  });
+  return out;
+}
+// 可展開的一列：summary 顯示總計，展開後顯示明細
+function drill(label, total, inner) {
+  return `<details class="drill"><summary><span>${esc(label)}</span><b class="${numCls(total)}">${num(total)}</b></summary><div class="drill-body">${inner}</div></details>`;
+}
+function subRows(entries) {
+  return entries.map(([k, v]) => `<div class="sub-row"><span>${esc(k)}</span><span class="${numCls(v)}">${num(v)}</span></div>`).join('');
+}
+function itemRows(arr) {
+  return arr.sort((a, b) => a.date.localeCompare(b.date))
+    .map(t => `<div class="sub-row" data-act="editTx" data-id="${t.id}"><span><small>${Number(t.date.slice(5, 7))}/${Number(t.date.slice(8))}</small> ${esc(stripShared(t.note) || t.category)}</span><span class="${numCls(signed(t))}">${num(signed(t))}</span></div>`).join('');
+}
+function reportTotal(label, total) {
+  return `<div class="report-total"><span>${label}</span><b class="${numCls(total)}">${num(total)}</b></div>`;
+}
+function bySum(arr, keyFn) {
+  const g = {};
+  arr.forEach(t => { const k = keyFn(t); (g[k] = g[k] || []).push(t); });
+  return g;
+}
+
+function moneyReports() {
+  const m = S.moneyMonth;
+  const tx = monthTx(m);
+  if (!tx.length) return '<div class="card"><div class="empty">這個月還沒有記帳</div></div>';
+
+  // 1. 帳戶餘額：信用卡以外的帳戶，收入加、支出減（含帳戶互轉）
+  const bankTx = tx.filter(t => !isCard(t.account));
+  const byAcct = bySum(bankTx, t => String(t.account || '').trim() || '（未填帳戶）');
+  const acctNames = Object.keys(byAcct).sort(acctOrder);
+  const balTotal = sum(bankTx.map(t => ({ amount: signed(t) })));
+  const balanceCard = `<div class="card report"><h3>帳戶餘額 <span>點帳戶看明細</span></h3>
+    ${acctNames.map(a => {
+      const arr = byAcct[a];
+      const part = (type, label) => {
+        const g = groupSum(arr.filter(t => t.type === type), 'category').map(([k, v]) => [k, type === 'income' ? v : -v]);
+        return g.length ? `<div class="sub-head">${label}</div>${subRows(g)}` : '';
+      };
+      return drill(a, sum(arr.map(t => ({ amount: signed(t) }))), part('expense', '支出') + part('income', '收入'));
+    }).join('')}
+    ${reportTotal('總和', balTotal)}</div>`;
+
+  // 2. 信用卡費：用信用卡付的支出
+  const cardTx = tx.filter(t => t.type === 'expense' && isCard(t.account));
+  const byCard = bySum(cardTx, t => t.account);
+  const cardCard = `<div class="card report"><h3>信用卡費</h3>
+    ${Object.keys(byCard).length ? Object.entries(byCard).sort((a, b) => sum(b[1]) - sum(a[1]))
+      .map(([c, arr]) => drill(c, -sum(arr), itemRows(arr))).join('') + reportTotal('總和', -sum(cardTx))
+      : '<div class="empty">這個月沒有刷卡</div>'}</div>`;
+
+  // 3. 前月帳戶餘額：上個月各帳戶結餘 vs 這個月 1 號登記的餘額
+  const prev = accountBalances(addMonths(m, -1));
+  const opening = {};
+  tx.filter(t => t.type === 'income' && OPENING_RE.test(String(t.category || '')) && !isCard(t.account))
+    .forEach(t => { const a = String(t.account || '').trim(); opening[a] = (opening[a] || 0) + Number(t.amount || 0); });
+  const recAccts = uniq(Object.keys(prev).concat(Object.keys(opening))).sort(acctOrder);
+  const pSum = recAccts.reduce((s, a) => s + (prev[a] || 0), 0);
+  const oSum = recAccts.reduce((s, a) => s + (opening[a] || 0), 0);
+  const recCard = `<div class="card report"><h3>前月帳戶餘額 <span>差額 = 1 號餘額 − 前月結餘</span></h3>
+    ${recAccts.length ? `<table class="rtable">
+      <thead><tr><th>帳戶</th><th>前月結餘</th><th>1 號餘額</th><th>差額</th></tr></thead>
+      <tbody>${recAccts.map(a => {
+        const p = prev[a] || 0, o = opening[a] || 0, d = o - p;
+        return `<tr><td>${esc(a)}</td><td>${num(p)}</td><td>${num(o)}</td><td class="${Math.round(d) ? 'diff' : 'muted'}">${num(d)}</td></tr>`;
+      }).join('')}</tbody>
+      <tfoot><tr><td>總和</td><td>${num(pSum)}</td><td>${num(oSum)}</td><td>${num(oSum - pSum)}</td></tr></tfoot>
+    </table>${Object.keys(prev).length ? '' : '<p class="help">上個月沒有記帳資料，前月結餘以 0 計算。</p>'}`
+      : '<div class="empty">沒有資料</div>'}</div>`;
+
+  // 4. 共同生活開銷：內容有「(共同)」的支出
+  const sharedTx = tx.filter(t => t.type === 'expense' && isShared(t));
+  const byCat = bySum(sharedTx, t => String(t.category || '').trim() || '其他');
+  const sharedCard = `<div class="card report"><h3>共同生活開銷</h3>
+    ${sharedTx.length ? Object.entries(byCat).sort((a, b) => sum(b[1]) - sum(a[1]))
+      .map(([c, arr]) => drill(c, -sum(arr), itemRows(arr))).join('') + reportTotal('總和', -sum(sharedTx))
+      : '<div class="empty">這個月沒有共同支出</div>'}</div>`;
+
+  return balanceCard + cardCard + recCard + sharedCard;
+}
+
 function moneyList() {
   const tx = monthTx(S.moneyMonth)
     .sort((a, b) => b.date.localeCompare(a.date) || String(b.createdAt).localeCompare(String(a.createdAt)));
@@ -667,7 +1014,9 @@ function openForm(opts) {
   f.innerHTML = opts.fields.map(fieldHtml).join('') + `
     ${opts.hint ? `<p class="help">${opts.hint}</p>` : ''}
     <div class="form-actions">
-      <button type="submit" class="btn">儲存</button>
+      ${(opts.extra || []).filter(x => x.primary).map(x => `<button type="button" class="btn" data-act="formExtra" data-i="${opts.extra.indexOf(x)}">${esc(x.label)}</button>`).join('')}
+      <button type="submit" class="btn ${(opts.extra || []).some(x => x.primary) ? 'secondary' : ''}">${esc(opts.submitLabel || '儲存')}</button>
+      ${(opts.extra || []).filter(x => !x.primary).map(x => `<button type="button" class="btn secondary" data-act="formExtra" data-i="${opts.extra.indexOf(x)}">${esc(x.label)}</button>`).join('')}
       ${opts.onDelete ? '<button type="button" class="btn danger" data-act="formDelete">刪除</button>' : ''}
     </div>`;
   $('#modal').classList.remove('hidden');
@@ -917,6 +1266,25 @@ function openDiary(date) {
 /* ───────── 動作 ───────── */
 const ACTIONS = {
   go: el => go(el.dataset.view),
+  goBills: () => { S.moneyMode = 'bills'; S.moneyMonth = today().slice(0, 7); go('money'); },
+  newBill: () => billForm(),
+  editBill: el => billForm(find('Bills', el.dataset.id)),
+  billDetail: el => billDetail(el.dataset.id, el.dataset.ym),
+  seedBills: () => {
+    if (S.data.Bills.length) return;
+    BILL_SEED.forEach((b, i) => createRec('Bills', Object.assign({ card: '', closeDay: '', dueOffset: 0, amount: 0, overrides: '{}', active: true, sort: i }, b)));
+    render();
+    toast('已建立 ' + BILL_SEED.length + ' 筆固定扣款');
+  },
+  formExtra: el => {
+    const x = formState.opts.extra[Number(el.dataset.i)];
+    const before = formState;
+    try {
+      x.fn(readForm());
+      if (formState === before) closeForm(); // fn 自己開了別的表單就不要關
+      render();
+    } catch (err) { toast(err.message, true); }
+  },
   goMoney: () => { S.moneyMode = 'dash'; S.moneyMonth = today().slice(0, 7); go('money'); },
   newTx: () => txForm(),
   newTask: () => taskForm(),
@@ -1028,10 +1396,10 @@ $('#modalForm').addEventListener('focusout', e => {
   if (!el.value) el.value = el.dataset.prev;
   delete el.dataset.prev;
 });
-$('#modalForm').addEventListener('change', e => { if (['allDay', 'repeat'].includes(e.target.name)) rerenderForm(); });
+$('#modalForm').addEventListener('change', e => { if (['allDay', 'repeat', 'kind'].includes(e.target.name)) rerenderForm(); });
 $('#fab').addEventListener('click', () => {
   ({
-    today: () => txForm(), money: () => txForm(), tasks: () => taskForm(),
+    today: () => txForm(), money: () => S.moneyMode === 'bills' ? billForm() : txForm(), tasks: () => taskForm(),
     calendar: () => eventForm(null, S.calSel), routines: () => routineForm(),
     notes: () => S.notesMode === 'diary' ? openDiary(today()) : noteForm(null, 'note'),
   })[S.view]();
