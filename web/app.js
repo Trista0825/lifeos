@@ -1,11 +1,26 @@
 /* LifeOS 前端 — 原生 JavaScript，不需要編譯 */
 'use strict';
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.2.0';
 const ENTITIES = ['Transactions', 'Tasks', 'Events', 'Routines', 'RoutineLogs'];
-const EXPENSE_CATS = ['餐飲', '交通', '購物', '居家', '娛樂', '醫療', '學習', '其他'];
-const INCOME_CATS = ['薪資', '獎金', '投資', '其他收入'];
-const ACCOUNTS = ['現金', '信用卡', '銀行', '電子支付'];
+// 選項來自原本的記帳小程序；清單只是建議，輸入框仍可打清單以外的新值
+const EXPENSE_CATS = ['餐食', '飲料', '交通', '家用', '服飾', '保養品', '課程', '娛樂', '醫療', '保險', '固定開銷',
+  '其他', '卡費', '帳戶互轉', '旅遊', '咘咘表晚餐', 'Hana', '股票'];
+const INCOME_CATS = ['薪資收入', '利息收入', '獎金收入', '咘咘收入', '其他收入(代付)', '富邦餘額', '國泰餘額', '中信餘額',
+  '第一餘額', '台新餘額', '安泰餘額', '現金餘額', '聯邦餘額', 'Line pay餘額', 'LINE BANK 餘額', '支付寶',
+  '玉山餘額', '帳戶互轉', 'IPass money餘額', '永豐餘額'];
+// 「共同」：勾選時在備註後面加上這段文字（沿用原本記帳程序的規則）
+const SHARED_SUFFIX = '(共同)';
+const SHARED_RE = /[(（]共同[)）]\s*$/;
+function isShared(t) { return SHARED_RE.test(String(t.note || '')); }
+function stripShared(note) { return String(note || '').replace(SHARED_RE, '').trim(); }
+// 支出用「支付方式」
+const PAY_METHODS = ['現金', '國泰信用卡', '台新信用卡', '富邦信用卡', '聯邦信用卡', '中信信用卡', '玉山信用卡',
+  '國泰帳戶', '第一帳戶', '富邦帳戶', '中信帳戶', '上海帳戶', '玉山帳戶', '安泰帳戶', '台新帳戶',
+  'line pay', '聯邦帳戶', '計咘咘帳上', '支付寶', '王道帳戶', 'IPass money', '收銀機'];
+// 收入用「入帳銀行」
+const BANKS = ['現金', '富邦帳戶', '國泰帳戶', '中信帳戶', '台新帳戶', '第一帳戶', '安泰帳戶', '上海帳戶', '聯邦帳戶',
+  'line pay', 'LINE BANK', '回饋金', '支付寶', '王道帳戶', '玉山帳戶', '永豐帳戶', 'IPass money', '收銀機'];
 const DOW = ['日', '一', '二', '三', '四', '五', '六'];
 const TITLES = { today: '今天', money: '記帳', tasks: '待辦', calendar: '行事曆', routines: '習慣', settings: '設定' };
 
@@ -181,8 +196,8 @@ function txItem(t) {
   const cls = t.type === 'income' ? 'income' : 'expense';
   return `<li class="item">
     <div class="main" data-act="editTx" data-id="${t.id}">
-      <div class="title">${esc(t.category || (t.type === 'income' ? '收入' : '支出'))}</div>
-      <div class="sub">${esc([t.account, t.note].filter(Boolean).join(' · '))}</div>
+      <div class="title">${esc(t.category || (t.type === 'income' ? '收入' : '支出'))}${isShared(t) ? ' <span class="tag">共同</span>' : ''}</div>
+      <div class="sub">${esc([t.account, stripShared(t.note)].filter(Boolean).join(' · '))}</div>
     </div>
     <div class="amount ${cls}">${t.type === 'income' ? '+' : '-'}${money(t.amount)}</div></li>`;
 }
@@ -239,6 +254,7 @@ const VIEWS = {
       .sort((a, b) => b.date.localeCompare(a.date) || String(b.createdAt).localeCompare(String(a.createdAt)));
     const inc = tx.filter(x => x.type === 'income').reduce((s, x) => s + Number(x.amount), 0);
     const exp = tx.filter(x => x.type === 'expense').reduce((s, x) => s + Number(x.amount), 0);
+    const sharedExp = tx.filter(x => x.type === 'expense' && isShared(x)).reduce((s, x) => s + Number(x.amount), 0);
     const byCat = {};
     tx.filter(x => x.type === 'expense').forEach(x => { const c = x.category || '其他'; byCat[c] = (byCat[c] || 0) + Number(x.amount); });
     const cats = Object.entries(byCat).sort((a, b) => b[1] - a[1]);
@@ -256,6 +272,7 @@ const VIEWS = {
         <div class="stat"><div class="label">支出</div><div class="value expense">${money(exp)}</div></div>
         <div class="stat"><div class="label">結餘</div><div class="value">${money(inc - exp)}</div></div>
       </div>
+      ${sharedExp ? `<div class="card" style="display:flex;justify-content:space-between"><span>其中共同支出</span><span class="expense" style="font-weight:600">${money(sharedExp)}</span></div>` : ''}
       ${cats.length ? `<div class="card"><h3>支出分類</h3>${cats.map(([c, v]) => `
         <div class="bar-row"><span>${esc(c)}</span><div class="bar"><i style="width:${Math.max(3, v / max * 100)}%"></i></div>
         <span class="num">${money(v)} · ${Math.round(v / exp * 100)}%</span></div>`).join('')}</div>` : ''}
@@ -400,6 +417,7 @@ function fieldHtml(fd) {
   const v = formState.values[fd.name];
   const id = 'f_' + fd.name;
   if (fd.hidden && fd.hidden(formState.values)) return '';
+  if (typeof fd.label === 'function') fd = Object.assign({}, fd, { label: fd.label(formState.values) });
   switch (fd.type) {
     case 'row':
       return `<div class="row2">${fd.fields.map(fieldHtml).join('')}</div>`;
@@ -472,24 +490,34 @@ async function submitForm() {
 /* ───────── 各類表單 ───────── */
 function uniq(arr) { return [...new Set(arr.filter(Boolean))]; }
 
+// 同類型最近一筆用的支付方式／入帳銀行，當作新增時的預設值
+function lastAccount(type) {
+  const arr = S.data.Transactions.filter(t => t.type === type && t.account)
+    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  return arr.length ? arr[0].account : '現金';
+}
+
 function txForm(rec) {
   openForm({
     title: rec ? '編輯記帳' : '記一筆',
-    values: rec ? Object.assign({}, rec) : { type: 'expense', date: S.view === 'money' && S.moneyMonth !== today().slice(0, 7) ? S.moneyMonth + '-01' : today(), account: '現金' },
+    values: rec ? Object.assign({}, rec, { shared: isShared(rec), note: stripShared(rec.note) }) : { type: 'expense', shared: false, date: S.view === 'money' && S.moneyMonth !== today().slice(0, 7) ? S.moneyMonth + '-01' : today(), account: lastAccount('expense') },
     fields: [
       { name: 'type', type: 'txType' },
       { name: 'amount', label: '金額', type: 'number', placeholder: '0' },
-      { name: 'category', label: '分類', suggest: v => uniq((v.type === 'income' ? INCOME_CATS : EXPENSE_CATS).concat(S.data.Transactions.filter(t => t.type === v.type).map(t => t.category))) },
+      { name: 'category', label: '類別', placeholder: '點一下可從清單選，或直接輸入', suggest: v => uniq((v.type === 'income' ? INCOME_CATS : EXPENSE_CATS).concat(S.data.Transactions.filter(t => t.type === v.type).map(t => t.category))) },
       { type: 'row', fields: [
         { name: 'date', label: '日期', type: 'date' },
-        { name: 'account', label: '帳戶', suggest: () => uniq(ACCOUNTS.concat(S.data.Transactions.map(t => t.account))) },
+        { name: 'account', label: v => v.type === 'income' ? '入帳銀行' : '支付方式', suggest: v => uniq((v.type === 'income' ? BANKS : PAY_METHODS).concat(S.data.Transactions.filter(t => t.type === v.type).map(t => t.account))) },
       ] },
       { name: 'note', label: '備註' },
+      { name: 'shared', label: '共同（儲存時在備註後加上「(共同)」）', type: 'checkbox' },
     ],
     onSave: async v => {
       if (!(Number(v.amount) > 0)) throw new Error('請輸入金額');
       if (!v.date) throw new Error('請選擇日期');
-      const data = { type: v.type, amount: Number(v.amount), category: v.category || '其他', date: v.date, account: v.account, note: v.note };
+      const base = stripShared(v.note);
+      const note = v.shared ? (base ? base + SHARED_SUFFIX : SHARED_SUFFIX) : base;
+      const data = { type: v.type, amount: Number(v.amount), category: v.category || '其他', date: v.date, account: v.account, note };
       rec ? await updateRec('Transactions', rec.id, data) : await createRec('Transactions', data);
     },
     onDelete: rec && (() => removeRec('Transactions', rec.id)),
@@ -631,7 +659,17 @@ const ACTIONS = {
     }
   },
   // 表單內
-  pickType: el => { readForm(); formState.values.type = el.dataset.v; rerenderForm(); },
+  pickType: el => {
+    readForm();
+    const v = formState.values;
+    if (v.type !== el.dataset.v) {
+      v.type = el.dataset.v;
+      // 切換收入／支出時，類別和帳戶清單不同，清掉舊值並帶入該類型上次用的帳戶
+      v.category = '';
+      v.account = lastAccount(v.type);
+    }
+    rerenderForm();
+  },
   pickDay: el => {
     readForm();
     const d = el.dataset.v;
