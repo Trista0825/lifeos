@@ -1,8 +1,8 @@
 /* LifeOS 前端 — 原生 JavaScript，不需要編譯 */
 'use strict';
 
-const APP_VERSION = '2.2.0';
-const ENTITIES = ['Transactions', 'Tasks', 'Events', 'Routines', 'RoutineLogs', 'Notes', 'Bills'];
+const APP_VERSION = '2.3.0';
+const ENTITIES = ['Transactions', 'Tasks', 'Events', 'Routines', 'RoutineLogs', 'Notes', 'Bills', 'Quick'];
 
 // 選項來自原本的記帳小程序；清單只是建議，輸入框仍可打清單以外的新值
 const EXPENSE_CATS = ['餐食', '飲料', '交通', '家用', '服飾', '保養品', '課程', '娛樂', '醫療', '保險', '固定開銷',
@@ -26,6 +26,10 @@ const CARD_RE = /信用卡/;
 // 報表：收入類別以「餘額」結尾的視為當月 1 號的期初餘額
 const OPENING_RE = /餘額\s*$/;
 
+const TRANSFER_CAT = '帳戶互轉';
+const QUICK_MAX = 12;        // 常用按鈕最多幾個（釘選的先排，再用歷史紀錄補）
+const QUICK_HISTORY = 1500;  // 統計常用按鈕時往回看幾筆
+
 // 「建立固定扣款」按鈕會建立的預設項目（之後都可以在 App 裡修改）
 const BILL_SEED = [
   { name: '富邦卡費', kind: 'card', card: '富邦信用卡', payAccount: '富邦帳戶', closeDay: 20, dueDay: 5, dueOffset: 1, category: '卡費', recordNote: '富邦卡費' },
@@ -45,7 +49,7 @@ const REPEAT_OPTS = [['', '不重複'], ['daily', '每天'], ['weekly', '每週'
 const REPEAT_LABEL = Object.fromEntries(REPEAT_OPTS);
 const MOODS = [['', '—'], ['😄', '😄 很好'], ['🙂', '🙂 不錯'], ['😐', '😐 普通'], ['😔', '😔 低落'], ['😫', '😫 很累']];
 const DOW = ['日', '一', '二', '三', '四', '五', '六'];
-const TITLES = { today: '今天', money: '記帳', tasks: '待辦', calendar: '行事曆', routines: '習慣', notes: '筆記', settings: '設定' };
+const TITLES = { today: '今天', money: '記帳', tasks: '待辦', calendar: '行事曆', routines: '習慣', notes: '筆記', settings: '設定', reconcile: '月初對帳' };
 
 /* ───────── 狀態 ───────── */
 const S = {
@@ -56,6 +60,7 @@ const S = {
   view: 'today',
   moneyMode: 'dash',
   moneyMonth: ymd(new Date()).slice(0, 7),
+  recMonth: ymd(new Date()).slice(0, 7),
   calMonth: ymd(new Date()).slice(0, 7),
   calSel: ymd(new Date()),
   taskFilter: 'open',
@@ -361,6 +366,14 @@ function eventItem(e) {
     </div></li>`;
 }
 function txItem(t) {
+  const pr = transferPair(t);
+  if (pr && pr.out && pr.in && t.type === 'expense') {
+    return `<li class="item"><div class="main" data-act="editTx" data-id="${t.id}">
+      <div class="title">轉帳 <span class="tag muted">不計入總覽</span></div>
+      <div class="sub">${esc(pr.out.account)} → ${esc(pr.in.account)}${t.note && t.note !== TRANSFER_CAT ? ' · ' + esc(t.note) : ''}</div></div>
+      <div class="amount muted">${money(t.amount)}</div></li>`;
+  }
+  if (pr && pr.out && pr.in && t.type === 'income') return '';
   const cls = t.type === 'income' ? 'income' : 'expense';
   const note = stripShared(t.note);
   return `<li class="item">
@@ -433,6 +446,7 @@ const VIEWS = {
         ${list(routines.map(r => routineItem(r, t)), '今天沒有排定的例行公事')}</div>
       <div class="card"><h3>待辦（今天與逾期）<a data-act="go" data-view="tasks">全部 ›</a></h3>
         ${list(tasks.slice(0, 8).map(taskItem), '都完成了 🎉')}</div>
+      ${todayReconcile()}
       ${todayBills()}
       <div class="card"><h3>本月收支 <a data-act="goMoney">總覽 ›</a></h3>
         <div class="stats">
@@ -554,6 +568,11 @@ const VIEWS = {
         <div class="field"><label>API Token</label><input id="cfgToken" value="${esc(S.cfg.token)}" placeholder="執行 setup() 後在執行紀錄中取得"></div>
         <div class="form-actions"><button class="btn" data-act="saveCfg">儲存並測試連線</button></div>
       </div>
+      <div class="card"><h3>常用按鈕</h3>
+        <p class="help">記帳時最上面的快捷按鈕。釘選的會排在最前面，其餘依你最常記的項目自動補上（最多 ${QUICK_MAX} 個）。記帳時勾選「加入常用按鈕」就能釘選。</p>
+        ${list(S.data.Quick.map(q => `<li class="item"><div class="main" data-act="editQuick" data-id="${q.id}"><div class="title">📌 ${esc(q.name)}${q.shared ? ' <span class="tag">共同</span>' : ''}</div>
+          <div class="sub">${q.type === 'income' ? '收入' : '支出'} · ${esc([q.category, q.account].filter(Boolean).join(' · '))}${Number(q.amount) ? ' · ' + money(q.amount) : ''}</div></div></li>`), '還沒有釘選的常用按鈕')}
+      </div>
       <div class="card"><h3>資料</h3>
         <p class="help">資料都存在你自己的 Google 試算表裡，這台裝置保留一份快取。<br>
         離線時可以照常查看與新增，連上網路後會自動上傳。<br>
@@ -567,6 +586,16 @@ const VIEWS = {
     </div>`;
   },
 };
+
+// 今天頁：每月 1–10 號，還沒登記期初餘額時提醒對帳
+function todayReconcile() {
+  const t = today(), m = t.slice(0, 7);
+  if (Number(t.slice(8)) > 10 || !S.data.Transactions.length) return '';
+  if (monthTx(m).some(x => isOpening(x) && !isCard(x.account))) return '';
+  return `<div class="card"><h3>月初對帳</h3>
+    <p class="help" style="margin:0 0 10px">${Number(m.slice(5))} 月的期初餘額還沒登記。填一下各帳戶的實際餘額，順便檢查上個月有沒有漏記。</p>
+    <button class="btn" data-act="openReconcile" data-m="${m}">開始 ${Number(m.slice(5))} 月對帳</button></div>`;
+}
 
 // 今天頁：7 天內（含已過期未記帳）的扣款，與帳戶不足提醒
 function todayBills() {
@@ -685,8 +714,10 @@ function billInfo(b, ym) {
   }
   const planned = hasOv ? Number(ov) : b.kind === 'card' ? estimate : Number(b.amount) || 0;
   const paid = paidTx.length > 0;
-  return { bill: b, ym, due, paid, paidTx, paidAmt: sum(paidTx), planned, amount: paid ? sum(paidTx) : planned,
-    hasOv, cycle, swipes, estimate, closed, overdue: !paid && due < today() };
+  return {
+    bill: b, ym, due, paid, paidTx, paidAmt: sum(paidTx), planned, amount: paid ? sum(paidTx) : planned,
+    hasOv, cycle, swipes, estimate, closed, overdue: !paid && due < today()
+  };
 }
 function billsInMonth(ym) { return activeBills().map(b => billInfo(b, ym)).sort((a, b) => a.due.localeCompare(b.due)); }
 function billStatusText(i) {
@@ -738,8 +769,8 @@ function moneyBills() {
       <p class="help">設定每月固定扣款後，App 會自動：<br>・在行事曆標出扣款日和信用卡結帳日<br>・用你的刷卡紀錄預估每期卡費<br>・比對明細，看哪些已經扣款<br>・算出每個扣款帳戶還差多少</p>
       <div class="form-actions"><button class="btn" data-act="seedBills">一鍵建立 4 張信用卡＋3 筆貸款</button><button class="btn secondary" data-act="newBill">自己新增</button></div>
       <p class="help">會建立：<br>${BILL_SEED.map(b => esc(b.name) + (b.kind === 'card'
-        ? `：每月 ${b.closeDay} 號結帳，${b.dueOffset ? '次月' : '當月'} ${b.dueDay} 號從${esc(b.payAccount)}扣款`
-        : `：每月 ${b.dueDay} 號從${esc(b.payAccount)}扣 ${money(b.amount)}`)).join('<br>')}</p></div>`;
+      ? `：每月 ${b.closeDay} 號結帳，${b.dueOffset ? '次月' : '當月'} ${b.dueDay} 號從${esc(b.payAccount)}扣款`
+      : `：每月 ${b.dueDay} 號從${esc(b.payAccount)}扣 ${money(b.amount)}`)).join('<br>')}</p></div>`;
   }
   const infos = billsInMonth(ym);
   const ready = accountReadiness(ym);
@@ -756,13 +787,13 @@ function moneyBills() {
     <div class="card"><h3>${Number(ym.slice(5))} 月扣款 <span>${infos.filter(i => i.paid).length} / ${infos.length} 已扣</span></h3>
       ${list(infos.map(i => billRow(i)), '這個月沒有扣款')}</div>
     ${cards.length ? `<div class="card"><h3>信用卡本期 <span>點卡片看刷卡明細</span></h3>${list(cards.map(b => {
-      const nextDueYm = addMonths(ym, Number(b.dueOffset) || 0);
-      const i = billInfo(b, nextDueYm);
-      return `<li class="item"><div class="time-col">${md(i.cycle.end)}<br><small>結帳</small></div>
+    const nextDueYm = addMonths(ym, Number(b.dueOffset) || 0);
+    const i = billInfo(b, nextDueYm);
+    return `<li class="item"><div class="time-col">${md(i.cycle.end)}<br><small>結帳</small></div>
         <div class="main" data-act="billDetail" data-id="${b.id}" data-ym="${nextDueYm}"><div class="title">${esc(b.card)}</div>
         <div class="sub">${md(i.cycle.start)}–${md(i.cycle.end)} · ${md(i.due)} 扣款${i.closed ? ' · 已結帳' : ''}</div></div>
         <div class="amount">${money(i.estimate)}</div></li>`;
-    }), '')}<p class="help">金額＝這期已記帳的刷卡合計。實際帳單可能包含沒記到的消費，收到帳單後點進去填實際金額。</p></div>` : ''}
+  }), '')}<p class="help">金額＝這期已記帳的刷卡合計。實際帳單可能包含沒記到的消費，收到帳單後點進去填實際金額。</p></div>` : ''}
     <div class="card"><h3>固定扣款設定 <a data-act="newBill">＋ 新增</a></h3>${list(S.data.Bills.slice().sort((a, b) => (Number(a.sort) || 0) - (Number(b.sort) || 0)).map(b => `
       <li class="item"><div class="main" data-act="editBill" data-id="${b.id}"><div class="title">${esc(b.name)}${b.active === false ? ' <span class="tag muted">暫停</span>' : ''}</div>
       <div class="sub">${b.kind === 'card' ? `${esc(b.card)} · ${b.closeDay} 號結帳 · ${b.dueOffset ? '次月' : '當月'} ${b.dueDay} 號扣款` : `每月 ${b.dueDay} 號 · ${money(b.amount)}`} · ${esc(b.payAccount)}</div></div></li>`), '')}</div>`;
@@ -792,20 +823,24 @@ function billDetail(id, ym) {
   openForm({
     title: `${b.name}・${Number(ym.slice(5))} 月`,
     values: { amount: i.hasOv ? i.planned : '' },
-    fields: [{ name: 'amount', type: 'number',
-      label: b.kind === 'card' ? `實際帳單金額（留空＝用刷卡合計 ${money(i.estimate)}）` : `本月金額（留空＝固定 ${money(b.amount)}）` }],
+    fields: [{
+      name: 'amount', type: 'number',
+      label: b.kind === 'card' ? `實際帳單金額（留空＝用刷卡合計 ${money(i.estimate)}）` : `本月金額（留空＝固定 ${money(b.amount)}）`
+    }],
     hint: lines.join('<br>'),
     submitLabel: '儲存金額',
     extra: [
       i.paid
         ? { label: '查看扣款紀錄', fn: () => { closeForm(); txForm(i.paidTx[0]); } }
-        : { label: '記為已扣款（新增一筆記帳）', primary: true, fn: v => {
+        : {
+          label: '記為已扣款（新增一筆記帳）', primary: true, fn: v => {
             const amt = v.amount !== '' ? Number(v.amount) : i.planned;
             if (!(amt > 0)) throw new Error('請先填帳單金額');
             saveOverride(b, ym, v.amount);
             createRec('Transactions', { type: 'expense', amount: amt, category: b.category || (b.kind === 'card' ? '卡費' : '貸款'), date: i.due, account: b.payAccount, note: billNote(b) });
             toast('已新增扣款記帳');
-          } },
+          }
+        },
       { label: '修改這個固定扣款的設定', fn: () => { closeForm(); billForm(b); } },
     ],
     onSave: v => saveOverride(b, ym, v.amount),
@@ -822,19 +857,25 @@ function billForm(rec) {
       { name: 'kind', label: '類型', type: 'select', options: [['card', '信用卡（金額依每期帳單）'], ['fixed', '固定金額（貸款、房租、保險…）']] },
       { name: 'name', label: '名稱', placeholder: '例如：玉山卡費、中信房租' },
       { name: 'card', label: '信用卡', suggest: cardSuggest, hidden: v => v.kind !== 'card' },
-      { type: 'row', hidden: v => v.kind !== 'card', fields: [
-        { name: 'closeDay', label: '每月結帳日', type: 'number', placeholder: '1–31' },
-        { name: 'dueOffset', label: '扣款月份', type: 'select', options: [[0, '結帳當月'], [1, '結帳次月']] },
-      ] },
-      { type: 'row', fields: [
-        { name: 'dueDay', label: '每月扣款日', type: 'number', placeholder: '1–31' },
-        { name: 'amount', label: '每月金額', type: 'number', hidden: v => v.kind !== 'fixed' },
-      ] },
+      {
+        type: 'row', hidden: v => v.kind !== 'card', fields: [
+          { name: 'closeDay', label: '每月結帳日', type: 'number', placeholder: '1–31' },
+          { name: 'dueOffset', label: '扣款月份', type: 'select', options: [[0, '結帳當月'], [1, '結帳次月']] },
+        ]
+      },
+      {
+        type: 'row', fields: [
+          { name: 'dueDay', label: '每月扣款日', type: 'number', placeholder: '1–31' },
+          { name: 'amount', label: '每月金額', type: 'number', hidden: v => v.kind !== 'fixed' },
+        ]
+      },
       { name: 'payAccount', label: '扣款帳戶', suggest: acctSuggest },
-      { type: 'row', fields: [
-        { name: 'category', label: '記帳類別', suggest: () => uniq(['卡費', '貸款', '固定開銷', '保險'].concat(EXPENSE_CATS)) },
-        { name: 'recordNote', label: '記帳內容', placeholder: '留空＝同名稱' },
-      ] },
+      {
+        type: 'row', fields: [
+          { name: 'category', label: '記帳類別', suggest: () => uniq(['卡費', '貸款', '固定開銷', '保險'].concat(EXPENSE_CATS)) },
+          { name: 'recordNote', label: '記帳內容', placeholder: '留空＝同名稱' },
+        ]
+      },
       { name: 'paused', label: '暫停（不再出現在行事曆和扣款）', type: 'checkbox', hidden: () => !rec },
     ],
     hint: '怎麼判斷「已扣款」：同一個月、同一個扣款帳戶、內容和「記帳內容」相同的支出，就算已扣款。日期超過該月天數時（例如 31 號），自動改成月底。',
@@ -843,8 +884,10 @@ function billForm(rec) {
       if (!String(v.name || '').trim()) throw new Error('請輸入名稱');
       if (!String(v.payAccount || '').trim()) throw new Error('請輸入扣款帳戶');
       if (!(day(v.dueDay) >= 1 && day(v.dueDay) <= 31)) throw new Error('扣款日要在 1–31 之間');
-      const data = { name: v.name.trim(), kind: v.kind, payAccount: v.payAccount.trim(), dueDay: day(v.dueDay),
-        category: (v.category || '').trim(), recordNote: (v.recordNote || '').trim(), active: !v.paused };
+      const data = {
+        name: v.name.trim(), kind: v.kind, payAccount: v.payAccount.trim(), dueDay: day(v.dueDay),
+        category: (v.category || '').trim(), recordNote: (v.recordNote || '').trim(), active: !v.paused
+      };
       if (v.kind === 'card') {
         if (!String(v.card || '').trim()) throw new Error('請輸入信用卡');
         if (!(day(v.closeDay) >= 1 && day(v.closeDay) <= 31)) throw new Error('結帳日要在 1–31 之間');
@@ -858,6 +901,90 @@ function billForm(rec) {
     },
     onDelete: rec && (() => removeRec('Bills', rec.id)),
   });
+}
+
+/* ───────── 帳戶互轉檢查 ───────── */
+// 同一天轉出合計＝轉入合計的視為相符（支援一筆轉出分到多個帳戶）；其餘再用相同金額配對
+function transferCheck(m) {
+  const tr = monthTx(m).filter(t => String(t.category || '').trim() === TRANSFER_CAT);
+  const outs = tr.filter(t => t.type === 'expense'), ins = tr.filter(t => t.type === 'income');
+  let left = [];
+  uniq(tr.map(t => t.date)).forEach(d => {
+    const o = outs.filter(t => t.date === d), i = ins.filter(t => t.date === d);
+    if (Math.round(sum(o)) !== Math.round(sum(i))) left = left.concat(o, i);
+  });
+  const lo = left.filter(t => t.type === 'expense'), li = left.filter(t => t.type === 'income');
+  const unmatched = [];
+  lo.forEach(t => {
+    const k = li.findIndex(x => Math.round(x.amount) === Math.round(t.amount));
+    if (k >= 0) li.splice(k, 1); else unmatched.push(t);
+  });
+  return { out: sum(outs), in: sum(ins), count: tr.length, unmatched: unmatched.concat(li) };
+}
+function transferCard(m) {
+  const c = transferCheck(m);
+  if (!c.count) return '';
+  return `<div class="card report"><h3>帳戶互轉檢查 <span>轉出 ${money(c.out)}・轉入 ${money(c.in)}</span></h3>
+    ${c.unmatched.length ? `<div class="alert warn" style="margin-bottom:6px">有 ${c.unmatched.length} 筆找不到對應的另一邊，帳戶餘額可能會不準</div>
+      ${c.unmatched.sort((a, b) => a.date.localeCompare(b.date)).map(t => `<div class="sub-row" data-act="editTx" data-id="${t.id}">
+        <span><small>${md(t.date)}</small> ${esc(t.account)} ${t.type === 'expense' ? '轉出' : '轉入'}</span><span class="${numCls(signed(t))}">${num(signed(t))}</span></div>`).join('')}
+      <p class="help">可能是漏記了另一邊，或是其實不是轉帳（例如期初餘額）。點一下可以修改。</p>`
+      : '<div class="alert ok" style="margin-bottom:0">✅ 轉出和轉入全部相符</div>'}</div>`;
+}
+
+/* ───────── 月初對帳 ───────── */
+function isOpening(t) { return t.type === 'income' && OPENING_RE.test(String(t.category || '')); }
+function openingCategoryFor(acct) {
+  const prev = S.data.Transactions.filter(t => isOpening(t) && String(t.account || '').trim() === acct)
+    .sort((a, b) => b.date.localeCompare(a.date));
+  return prev.length ? prev[0].category : acct.replace(/帳戶$/, '') + '餘額';
+}
+function reconcileData(m) {
+  const prevM = addMonths(m, -1);
+  const prev = accountBalances(prevM);
+  const openTx = monthTx(m).filter(t => isOpening(t) && !isCard(t.account));
+  const opening = {};
+  openTx.forEach(t => { const a = String(t.account || '').trim(); (opening[a] = opening[a] || []).push(t); });
+  const prevOpenAccts = monthTx(prevM).filter(t => isOpening(t) && !isCard(t.account)).map(t => String(t.account).trim());
+  const accts = uniq(Object.keys(prev).concat(Object.keys(opening), prevOpenAccts)).sort(acctOrder);
+  return accts.map(a => {
+    const rows = opening[a] || [];
+    return { acct: a, computed: Math.round(prev[a] || 0), rows, actual: rows.length ? sum(rows) : null };
+  });
+}
+
+VIEWS.reconcile = function () {
+  const m = S.recMonth, prevM = addMonths(m, -1);
+  const data = reconcileData(m);
+  const done = data.filter(r => r.actual !== null).length;
+  const pm = Number(prevM.slice(5)), cm = Number(m.slice(5));
+  const diffs = data.filter(r => r.actual !== null && Math.round(r.actual - r.computed) !== 0);
+  return `
+    <div class="toolbar"><button class="chip" data-act="backToMoney">‹ 返回記帳</button>${monthNav('recMonth', m)}</div>
+    <div class="card"><p class="help" style="margin:0">
+      ① 打開各家銀行 App，把 <b>${cm} 月 1 號</b> 的實際餘額填進「實際餘額」。<br>
+      ② 按「儲存」，會自動建立（或更新）${cm} 月的期初餘額，不用再一筆筆記帳。<br>
+      ③ 差額不是 0 的帳戶，代表 ${pm} 月有漏記或記錯，下面會列出該帳戶 ${pm} 月的明細方便核對。</p></div>
+    <div class="card report"><h3>${cm} 月期初餘額 <span>${done} / ${data.length} 已登記</span></h3>
+      <table class="rtable rec">
+        <thead><tr><th>帳戶</th><th>${pm} 月結餘<br><small>App 計算</small></th><th>實際餘額</th><th>差額</th></tr></thead>
+        <tbody>${data.map(r => `<tr>
+          <td>${esc(r.acct)}</td><td>${num(r.computed)}</td>
+          <td><input class="rec-input" type="number" inputmode="decimal" data-acct="${esc(r.acct)}" data-computed="${r.computed}" value="${r.actual === null ? '' : Math.round(r.actual)}" placeholder="${r.computed > 0 ? num(r.computed) : ''}"></td>
+          <td class="rec-diff" data-acct="${esc(r.acct)}">${r.actual === null ? '<span class="muted">—</span>' : diffHtml(r.actual - r.computed)}</td></tr>`).join('')}</tbody>
+      </table>
+      <div class="form-actions">
+        <button class="btn secondary" data-act="recFill">空白的帶入 App 計算的結餘</button>
+        <button class="btn" data-act="recSave">儲存 ${cm} 月期初餘額</button>
+      </div></div>
+    ${diffs.length ? `<div class="card report"><h3>有差額的帳戶 <span>點開看 ${pm} 月明細</span></h3>
+      ${diffs.map(r => drill(`${r.acct}（差 ${r.actual - r.computed > 0 ? '+' : ''}${num(r.actual - r.computed)}）`, r.computed,
+    itemRows(monthTx(prevM).filter(t => String(t.account || '').trim() === r.acct)))).join('')}
+      <p class="help">常見原因：漏記一筆、轉帳只記了一邊、金額打錯、刷卡記成帳戶扣款。</p></div>` : ''}`;
+};
+function diffHtml(d) {
+  d = Math.round(d);
+  return d ? `<span class="diff">${d > 0 ? '+' : ''}${num(d)}</span>` : '<span class="income">✓ 0</span>';
 }
 
 /* ───────── 報表 ───────── */
@@ -910,13 +1037,13 @@ function moneyReports() {
   const balTotal = sum(bankTx.map(t => ({ amount: signed(t) })));
   const balanceCard = `<div class="card report"><h3>帳戶餘額 <span>點帳戶看明細</span></h3>
     ${acctNames.map(a => {
-      const arr = byAcct[a];
-      const part = (type, label) => {
-        const g = groupSum(arr.filter(t => t.type === type), 'category').map(([k, v]) => [k, type === 'income' ? v : -v]);
-        return g.length ? `<div class="sub-head">${label}</div>${subRows(g)}` : '';
-      };
-      return drill(a, sum(arr.map(t => ({ amount: signed(t) }))), part('expense', '支出') + part('income', '收入'));
-    }).join('')}
+    const arr = byAcct[a];
+    const part = (type, label) => {
+      const g = groupSum(arr.filter(t => t.type === type), 'category').map(([k, v]) => [k, type === 'income' ? v : -v]);
+      return g.length ? `<div class="sub-head">${label}</div>${subRows(g)}` : '';
+    };
+    return drill(a, sum(arr.map(t => ({ amount: signed(t) }))), part('expense', '支出') + part('income', '收入'));
+  }).join('')}
     ${reportTotal('總和', balTotal)}</div>`;
 
   // 2. 信用卡費：用信用卡付的支出
@@ -935,13 +1062,14 @@ function moneyReports() {
   const recAccts = uniq(Object.keys(prev).concat(Object.keys(opening))).sort(acctOrder);
   const pSum = recAccts.reduce((s, a) => s + (prev[a] || 0), 0);
   const oSum = recAccts.reduce((s, a) => s + (opening[a] || 0), 0);
-  const recCard = `<div class="card report"><h3>前月帳戶餘額 <span>差額 = 1 號餘額 − 前月結餘</span></h3>
+  const recCard = `<div class="card report"><h3>前月帳戶餘額 <a data-act="openReconcile" data-m="${m}">開始對帳 ›</a></h3>
+    <p class="help" style="margin-top:-4px">差額 = 1 號餘額 − 前月結餘</p>
     ${recAccts.length ? `<table class="rtable">
       <thead><tr><th>帳戶</th><th>前月結餘</th><th>1 號餘額</th><th>差額</th></tr></thead>
       <tbody>${recAccts.map(a => {
-        const p = prev[a] || 0, o = opening[a] || 0, d = o - p;
-        return `<tr><td>${esc(a)}</td><td>${num(p)}</td><td>${num(o)}</td><td class="${Math.round(d) ? 'diff' : 'muted'}">${num(d)}</td></tr>`;
-      }).join('')}</tbody>
+    const p = prev[a] || 0, o = opening[a] || 0, d = o - p;
+    return `<tr><td>${esc(a)}</td><td>${num(p)}</td><td>${num(o)}</td><td class="${Math.round(d) ? 'diff' : 'muted'}">${num(d)}</td></tr>`;
+  }).join('')}</tbody>
       <tfoot><tr><td>總和</td><td>${num(pSum)}</td><td>${num(oSum)}</td><td>${num(oSum - pSum)}</td></tr></tfoot>
     </table>${Object.keys(prev).length ? '' : '<p class="help">上個月沒有記帳資料，前月結餘以 0 計算。</p>'}`
       : '<div class="empty">沒有資料</div>'}</div>`;
@@ -954,7 +1082,7 @@ function moneyReports() {
       .map(([c, arr]) => drill(c, -sum(arr), itemRows(arr))).join('') + reportTotal('總和', -sum(sharedTx))
       : '<div class="empty">這個月沒有共同支出</div>'}</div>`;
 
-  return balanceCard + cardCard + recCard + sharedCard;
+  return transferCard(m) + balanceCard + cardCard + recCard + sharedCard;
 }
 
 function moneyList() {
@@ -994,7 +1122,8 @@ function render() {
   $('#pageTitle').textContent = TITLES[v];
   $('#view').innerHTML = VIEWS[v]();
   document.querySelectorAll('.tabbar button').forEach(b => b.classList.toggle('active', b.dataset.view === v));
-  $('#fab').classList.toggle('hidden', v === 'settings');
+  $('#fab').classList.toggle('hidden', v === 'settings' || v === 'reconcile');
+  if (v === 'reconcile') document.querySelector('.tabbar [data-view="money"]').classList.add('active');
   if (search) { const el = $('#noteSearch'); el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
   updateStatus();
 }
@@ -1032,11 +1161,20 @@ function fieldHtml(fd) {
   switch (fd.type) {
     case 'row':
       return `<div class="row2">${fd.fields.map(fieldHtml).join('')}</div>`;
-    case 'txType':
-      return `<div class="field"><div class="type-toggle">
+    case 'txType': {
+      const tr = formState.values._allowTransfer;
+      return `<div class="field"><div class="type-toggle ${tr ? 'three' : ''}">
         <button type="button" class="expense ${v === 'expense' ? 'on' : ''}" data-act="pickType" data-v="expense">支出</button>
         <button type="button" class="income ${v === 'income' ? 'on' : ''}" data-act="pickType" data-v="income">收入</button>
+        ${tr ? `<button type="button" class="transfer ${v === 'transfer' ? 'on' : ''}" data-act="pickType" data-v="transfer">轉帳</button>` : ''}
       </div></div>`;
+    }
+    case 'chips': {
+      const chips = fd.chips(formState.values);
+      if (!chips.length) return '';
+      return `<div class="field"><label>常用</label><div class="chips">${chips.map((c, i) =>
+        `<button type="button" class="qchip ${c.type}${c.pinned ? ' pinned' : ''}" data-act="pickChip" data-i="${i}">${esc(c.name)}${c.shared ? '<sup>共</sup>' : ''}${c.amount ? `<small>${moneyShort(c.amount)}</small>` : ''}</button>`).join('')}</div></div>`;
+    }
     case 'textarea':
       return `<div class="field"><label for="${id}">${fd.label}</label><textarea id="${id}" name="${fd.name}" class="${fd.tall ? 'tall' : ''}" placeholder="${esc(fd.placeholder || '')}">${esc(v)}</textarea></div>`;
     case 'select':
@@ -1070,8 +1208,9 @@ function readForm() {
   });
   return vals;
 }
-function rerenderForm() {
-  readForm();
+// skipRead：呼叫端已經讀過並修改了 values，不要再用畫面上的舊值蓋掉
+function rerenderForm(skipRead) {
+  if (!skipRead) readForm();
   const o = formState.opts;
   o.values = formState.values;
   o.autofocus = false;
@@ -1102,32 +1241,129 @@ function lastAccount(type) {
   return arr.length ? arr[0].account : '現金';
 }
 
+function lastTransferAccount(type) {
+  const arr = S.data.Transactions.filter(t => t.type === type && t.category === TRANSFER_CAT && t.account)
+    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  return arr.length ? arr[0].account : '';
+}
+function transferPair(t) {
+  if (!t || !t.link) return null;
+  const pair = S.data.Transactions.filter(x => x.link === t.link);
+  return { out: pair.find(x => x.type === 'expense'), in: pair.find(x => x.type === 'income') };
+}
+
+/* 常用按鈕：釘選的先排，再依歷史出現次數補滿 */
+function quickChips() {
+  const pinned = S.data.Quick.slice().sort((a, b) => (Number(a.sort) || 0) - (Number(b.sort) || 0))
+    .map(q => ({ name: q.name, type: q.type, amount: Number(q.amount) || 0, category: q.category, account: q.account, shared: q.shared === true, pinned: true, id: q.id }));
+  const used = new Set(pinned.map(c => c.type + '|' + c.name + '|' + c.shared));
+  const stats = {};
+  S.data.Transactions.slice().sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, QUICK_HISTORY)
+    .forEach(t => {
+      const name = stripShared(t.note);
+      if (!name || t.category === TRANSFER_CAT || OPENING_RE.test(String(t.category || '')) || name === '餘額') return;
+      const k = t.type + '|' + name + '|' + isShared(t);
+      if (used.has(k)) return;
+      if (!stats[k]) stats[k] = { name, type: t.type, amount: Number(t.amount) || 0, category: t.category, account: t.account, shared: isShared(t), n: 0 };
+      stats[k].n++; // 欄位以最新一筆為準（已依建立時間新到舊排序）
+    });
+  const auto = Object.values(stats).filter(c => c.n >= 2).sort((a, b) => b.n - a.n);
+  return pinned.concat(auto).slice(0, Math.max(QUICK_MAX, pinned.length));
+}
+
 function txForm(rec) {
+  const pair = transferPair(rec);
+  const isTr = !!(pair && pair.out && pair.in);
+  const defDate = S.view === 'money' && S.moneyMonth !== today().slice(0, 7) ? S.moneyMonth + '-01' : today();
+  let values;
+  if (isTr) values = { type: 'transfer', amount: pair.out.amount, from: pair.out.account, to: pair.in.account, date: pair.out.date, note: stripShared(pair.out.note) === TRANSFER_CAT ? '' : stripShared(pair.out.note), _allowTransfer: true };
+  else if (rec) values = Object.assign({}, rec, { shared: isShared(rec), note: stripShared(rec.note), _allowTransfer: false });
+  else values = { type: 'expense', shared: false, date: defDate, account: lastAccount('expense'), _allowTransfer: true };
+  const chipList = rec ? [] : quickChips();
+  const whenTransfer = v => v.type === 'transfer';
+  const acctList = () => uniq(BANKS.concat(S.data.Transactions.map(t => t.account)).filter(a => !isCard(a)));
   openForm({
-    title: rec ? '編輯記帳' : '記一筆',
-    values: rec
-      ? Object.assign({}, rec, { shared: isShared(rec), note: stripShared(rec.note) })
-      : { type: 'expense', shared: false, date: S.view === 'money' && S.moneyMonth !== today().slice(0, 7) ? S.moneyMonth + '-01' : today(), account: lastAccount('expense') },
+    title: isTr ? '編輯轉帳' : rec ? '編輯記帳' : '記一筆',
+    values,
+    chipList,
     fields: [
       { name: 'type', type: 'txType' },
+      { type: 'chips', chips: v => v.type === 'transfer' ? [] : chipList },
       { name: 'amount', label: '金額', type: 'number', placeholder: '0' },
-      { name: 'category', label: '類別', placeholder: '點一下可從清單選，或直接輸入', suggest: v => uniq((v.type === 'income' ? INCOME_CATS : EXPENSE_CATS).concat(S.data.Transactions.filter(t => t.type === v.type).map(t => t.category))) },
-      { type: 'row', fields: [
-        { name: 'date', label: '日期', type: 'date' },
-        { name: 'account', label: v => v.type === 'income' ? '入帳銀行' : '支付方式', suggest: v => uniq((v.type === 'income' ? BANKS : PAY_METHODS).concat(S.data.Transactions.filter(t => t.type === v.type).map(t => t.account))) },
-      ] },
-      { name: 'note', label: '內容／備註' },
-      { name: 'shared', label: '共同（儲存時在內容後加上「(共同)」）', type: 'checkbox' },
+      { name: 'category', label: '類別', placeholder: '點一下可從清單選，或直接輸入', hidden: whenTransfer, suggest: v => uniq((v.type === 'income' ? INCOME_CATS : EXPENSE_CATS).concat(S.data.Transactions.filter(t => t.type === v.type).map(t => t.category))) },
+      {
+        type: 'row', hidden: v => v.type !== 'transfer', fields: [
+          { name: 'from', label: '轉出帳戶', suggest: acctList },
+          { name: 'to', label: '轉入帳戶', suggest: acctList },
+        ]
+      },
+      {
+        type: 'row', fields: [
+          { name: 'date', label: '日期', type: 'date' },
+          { name: 'account', label: v => v.type === 'income' ? '入帳銀行' : '支付方式', hidden: whenTransfer, suggest: v => uniq((v.type === 'income' ? BANKS : PAY_METHODS).concat(S.data.Transactions.filter(t => t.type === v.type).map(t => t.account))) },
+        ]
+      },
+      { name: 'note', label: v => v.type === 'transfer' ? '備註（可留空）' : '內容／備註' },
+      { name: 'shared', label: '共同（儲存時在內容後加上「(共同)」）', type: 'checkbox', hidden: whenTransfer },
+      { name: 'pin', label: '加入常用按鈕', type: 'checkbox', hidden: v => !!rec || v.type === 'transfer' },
     ],
+    hint: isTr ? '轉帳會同時修改轉出、轉入兩筆。' : '',
     onSave: v => {
       if (!(Number(v.amount) > 0)) throw new Error('請輸入金額');
       if (!v.date) throw new Error('請選擇日期');
+      if (v.type === 'transfer') return saveTransfer(v, isTr ? pair : null, rec);
       const base = stripShared(v.note);
       const note = v.shared ? (base ? base + SHARED_SUFFIX : SHARED_SUFFIX) : base;
       const data = { type: v.type, amount: Number(v.amount), category: (v.category || '').trim() || '其他', date: v.date, account: (v.account || '').trim(), note };
       rec ? updateRec('Transactions', rec.id, data) : createRec('Transactions', data);
+      if (v.pin && base && !S.data.Quick.some(q => q.type === v.type && q.name === base && (q.shared === true) === !!v.shared)) {
+        createRec('Quick', { name: base, type: v.type, amount: data.amount, category: data.category, account: data.account, shared: !!v.shared, sort: S.data.Quick.length });
+      }
     },
-    onDelete: rec && (() => removeRec('Transactions', rec.id)),
+    onDelete: rec && (() => {
+      if (isTr) { removeRec('Transactions', pair.out.id); removeRec('Transactions', pair.in.id); }
+      else removeRec('Transactions', rec.id);
+    }),
+  });
+}
+
+function saveTransfer(v, pair) {
+  const from = String(v.from || '').trim(), to = String(v.to || '').trim();
+  if (!from || !to) throw new Error('請填轉出和轉入帳戶');
+  if (from === to) throw new Error('轉出和轉入不能是同一個帳戶');
+  const note = String(v.note || '').trim() || TRANSFER_CAT;
+  const base = { amount: Number(v.amount), category: TRANSFER_CAT, date: v.date, note };
+  if (pair) {
+    updateRec('Transactions', pair.out.id, Object.assign({ type: 'expense', account: from }, base));
+    updateRec('Transactions', pair.in.id, Object.assign({ type: 'income', account: to }, base));
+  } else {
+    const link = uid();
+    createRec('Transactions', Object.assign({ type: 'expense', account: from, link }, base));
+    createRec('Transactions', Object.assign({ type: 'income', account: to, link }, base));
+  }
+}
+
+function quickForm(q) {
+  openForm({
+    title: '編輯常用按鈕',
+    values: Object.assign({}, q),
+    fields: [
+      { name: 'type', label: '類型', type: 'select', options: [['expense', '支出'], ['income', '收入']] },
+      { name: 'name', label: '內容' },
+      {
+        type: 'row', fields: [
+          { name: 'amount', label: '預設金額（0＝每次自己填）', type: 'number' },
+          { name: 'category', label: '類別', suggest: v => v.type === 'income' ? INCOME_CATS : EXPENSE_CATS },
+        ]
+      },
+      { name: 'account', label: '支付方式／入帳銀行', suggest: v => v.type === 'income' ? BANKS : PAY_METHODS },
+      { name: 'shared', label: '共同', type: 'checkbox' },
+    ],
+    onSave: v => {
+      if (!String(v.name || '').trim()) throw new Error('請輸入內容');
+      updateRec('Quick', q.id, { type: v.type, name: v.name.trim(), amount: Number(v.amount) || 0, category: (v.category || '').trim(), account: (v.account || '').trim(), shared: !!v.shared });
+    },
+    onDelete: () => removeRec('Quick', q.id),
   });
 }
 
@@ -1137,10 +1373,12 @@ function taskForm(rec, presetDue) {
     values: rec ? Object.assign({}, rec) : { priority: 1, due: presetDue || '', repeat: '' },
     fields: [
       { name: 'title', label: '要做什麼', placeholder: '例如：繳電話費' },
-      { type: 'row', fields: [
-        { name: 'due', label: '期限', type: 'date' },
-        { name: 'priority', label: '優先度', type: 'select', options: [[1, '一般'], [2, '中'], [3, '高']] },
-      ] },
+      {
+        type: 'row', fields: [
+          { name: 'due', label: '期限', type: 'date' },
+          { name: 'priority', label: '優先度', type: 'select', options: [[1, '一般'], [2, '中'], [3, '高']] },
+        ]
+      },
       { name: 'repeat', label: '重複', type: 'select', options: REPEAT_OPTS },
       { name: 'note', label: '備註', type: 'textarea' },
       { name: 'done', label: '已完成', type: 'checkbox', hidden: () => !rec },
@@ -1179,14 +1417,18 @@ function eventForm(rec, presetDate) {
       { name: 'title', label: '標題', placeholder: '例如：牙醫回診' },
       { name: 'date', label: v => v.repeat ? '開始日期' : '日期', type: 'date' },
       { name: 'allDay', label: '全天', type: 'checkbox' },
-      { type: 'row', hidden: v => v.allDay, fields: [
-        { name: 'start', label: '開始', type: 'time' },
-        { name: 'end', label: '結束', type: 'time' },
-      ] },
-      { type: 'row', fields: [
-        { name: 'repeat', label: '重複', type: 'select', options: REPEAT_OPTS },
-        { name: 'repeatUntil', label: '重複到（可留空）', type: 'date', hidden: v => !v.repeat },
-      ] },
+      {
+        type: 'row', hidden: v => v.allDay, fields: [
+          { name: 'start', label: '開始', type: 'time' },
+          { name: 'end', label: '結束', type: 'time' },
+        ]
+      },
+      {
+        type: 'row', fields: [
+          { name: 'repeat', label: '重複', type: 'select', options: REPEAT_OPTS },
+          { name: 'repeatUntil', label: '重複到（可留空）', type: 'date', hidden: v => !v.repeat },
+        ]
+      },
       { name: 'location', label: '地點' },
       { name: 'note', label: '備註', type: 'textarea' },
     ],
@@ -1234,10 +1476,12 @@ function noteForm(rec, kind) {
     title: (rec ? '編輯' : '新增') + (diary ? '日記' : '筆記'),
     values: rec ? Object.assign({}, rec) : { kind, date: diary ? today() : '', pinned: false, mood: '' },
     fields: diary ? [
-      { type: 'row', fields: [
-        { name: 'date', label: '日期', type: 'date' },
-        { name: 'mood', label: '心情', type: 'select', options: MOODS },
-      ] },
+      {
+        type: 'row', fields: [
+          { name: 'date', label: '日期', type: 'date' },
+          { name: 'mood', label: '心情', type: 'select', options: MOODS },
+        ]
+      },
       { name: 'content', label: '今天發生了什麼', type: 'textarea', tall: true },
       { name: 'tags', label: '標籤（用空格分開）', placeholder: '例如：旅行 家人' },
     ] : [
@@ -1266,6 +1510,42 @@ function openDiary(date) {
 /* ───────── 動作 ───────── */
 const ACTIONS = {
   go: el => go(el.dataset.view),
+  openReconcile: el => { S.recMonth = el.dataset.m || today().slice(0, 7); go('reconcile'); },
+  backToMoney: () => { S.moneyMode = 'report'; S.moneyMonth = S.recMonth; go('money'); },
+  recMonth: el => { S.recMonth = addMonths(S.recMonth, Number(el.dataset.n)); render(); },
+  recFill: () => {
+    document.querySelectorAll('.rec-input').forEach(el => {
+      const c = Number(el.dataset.computed);
+      if (el.value === '' && c >= 0) { el.value = c; el.dispatchEvent(new Event('input', { bubbles: true })); }
+    });
+  },
+  recSave: () => {
+    const m = S.recMonth;
+    const data = reconcileData(m);
+    let created = 0, updated = 0;
+    const bad = [];
+    document.querySelectorAll('.rec-input').forEach(el => {
+      if (el.value === '') return;
+      const val = Number(el.value);
+      const r = data.find(x => x.acct === el.dataset.acct);
+      if (!(val >= 0)) { bad.push(r.acct); return; }
+      if (r.rows.length) {
+        // 已經有期初餘額：改第一筆的金額，多出來的重複筆數刪掉
+        if (Math.round(sum(r.rows)) !== Math.round(val) || r.rows.length > 1) {
+          updateRec('Transactions', r.rows[0].id, { amount: val });
+          r.rows.slice(1).forEach(x => removeRec('Transactions', x.id));
+          updated++;
+        }
+      } else {
+        createRec('Transactions', { type: 'income', date: m + '-01', amount: val, category: openingCategoryFor(r.acct), account: r.acct, note: '餘額' });
+        created++;
+      }
+    });
+    render();
+    if (bad.length) toast(bad.join('、') + '：餘額不能是負數', true);
+    else toast(created || updated ? `已儲存（新增 ${created}、更新 ${updated} 筆）` : '沒有變更');
+  },
+  editQuick: el => quickForm(find('Quick', el.dataset.id)),
   goBills: () => { S.moneyMode = 'bills'; S.moneyMonth = today().slice(0, 7); go('money'); },
   newBill: () => billForm(),
   editBill: el => billForm(find('Bills', el.dataset.id)),
@@ -1341,9 +1621,19 @@ const ACTIONS = {
       v.type = el.dataset.v;
       // 切換收入／支出時，類別和帳戶清單不同，清掉舊值並帶入該類型上次用的帳戶
       v.category = '';
-      v.account = lastAccount(v.type);
+      if (v.type === 'transfer') { v.from = v.from || lastTransferAccount('expense'); v.to = v.to || ''; }
+      else v.account = lastAccount(v.type);
     }
-    rerenderForm();
+    rerenderForm(true);
+  },
+  pickChip: el => {
+    readForm();
+    const c = formState.opts.chipList[Number(el.dataset.i)];
+    Object.assign(formState.values, { type: c.type, category: c.category, account: c.account, note: c.name, shared: c.shared });
+    if (c.amount) formState.values.amount = c.amount;
+    rerenderForm(true);
+    const amt = $('#f_amount');
+    if (amt && !c.amount) amt.focus();
   },
   pickDay: el => {
     readForm();
@@ -1351,7 +1641,7 @@ const ACTIONS = {
     let days = String(formState.values.days || '');
     days = days.includes(d) ? days.replace(d, '') : days + d;
     formState.values.days = days.split('').sort().join('');
-    rerenderForm();
+    rerenderForm(true);
   },
   formDelete: () => {
     if (!confirm('確定要刪除嗎？')) return;
@@ -1371,6 +1661,10 @@ document.addEventListener('click', e => {
   }
 });
 document.addEventListener('input', e => {
+  if (e.target.classList.contains('rec-input')) {
+    const cell = document.querySelector(`.rec-diff[data-acct="${CSS.escape(e.target.dataset.acct)}"]`);
+    if (cell) cell.innerHTML = e.target.value === '' ? '<span class="muted">—</span>' : diffHtml(Number(e.target.value) - Number(e.target.dataset.computed));
+  }
   if (e.target.id === 'noteSearch') {
     S.noteQuery = e.target.value;
     $('#notesList').innerHTML = notesList();
@@ -1407,7 +1701,7 @@ $('#fab').addEventListener('click', () => {
 
 /* ───────── 啟動 ───────── */
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
-  navigator.serviceWorker.register('sw.js').catch(() => {});
+  navigator.serviceWorker.register('sw.js').catch(() => { });
 }
 if (!S.cfg.url || !S.cfg.token) {
   go('settings');

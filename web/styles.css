@@ -1069,3 +1069,74 @@ button {
 .modal .help {
   line-height: 1.7;
 }
+
+/* 轉帳、常用、對帳 */
+.type-toggle.three {
+  grid-template-columns: 1fr 1fr 1fr;
+}
+
+.type-toggle button.on.transfer {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.qchip {
+  border: 1px solid var(--line);
+  background: var(--bg);
+  border-radius: 99px;
+  padding: 6px 11px;
+  font-size: 13px;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.qchip.income {
+  border-color: rgba(31, 157, 107, .4);
+}
+
+.qchip.pinned {
+  border-color: var(--primary);
+}
+
+.qchip sup {
+  color: var(--primary);
+  font-size: 10px;
+}
+
+.qchip small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.rtable.rec input {
+  width: 96px;
+  padding: 7px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  text-align: right;
+}
+
+.rtable th small {
+  font-size: 10px;
+}
+
+.diff {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.card h3 a {
+  font-size: 13px;
+}
