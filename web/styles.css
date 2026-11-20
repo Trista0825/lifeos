@@ -177,7 +177,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
 /* 底部導覽 */
 .tabbar {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
-  display: grid; grid-template-columns: repeat(5, 1fr);
+  display: grid; grid-template-columns: repeat(6, 1fr);
   height: calc(var(--tabbar-h) + var(--safe-b)); padding-bottom: var(--safe-b);
   background: var(--card); border-top: 1px solid var(--line);
 }
@@ -241,3 +241,32 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .settings .field input { font-size: 14px; }
 .help { font-size: 13px; color: var(--muted); line-height: 1.6; }
 .help code { background: var(--line); padding: 1px 5px; border-radius: 4px; }
+
+/* v2 */
+.sync-state.pending { color: var(--warn); font-weight: 600; }
+.card.tight { padding-top: 4px; padding-bottom: 4px; }
+.chip { border: none; background: var(--card); border-radius: 10px; padding: 7px 14px; font-size: 14px; }
+.tag.muted { background: var(--line); color: var(--muted); }
+.toolbar { flex-wrap: wrap; }
+.kv { display: grid; gap: 8px; }
+.kv > div { display: flex; justify-content: space-between; font-size: 14px; }
+.kv span { color: var(--muted); }
+.bar > i.inc { background: var(--income); }
+.chart { display: flex; align-items: flex-end; gap: 2px; height: 120px; border-bottom: 1px solid var(--line); }
+.chart .col { flex: 1; height: 100%; display: flex; align-items: flex-end; justify-content: center; gap: 2px; }
+.chart .col i { display: block; width: 100%; background: var(--expense); border-radius: 3px 3px 0 0; }
+.chart.pair .col i { width: 40%; }
+.chart .col i.inc { background: var(--income); }
+.chart-x { display: flex; gap: 2px; font-size: 10px; color: var(--muted); margin-top: 4px; }
+.chart-x span { flex: 1; text-align: center; white-space: nowrap; overflow: visible; }
+.chart-x.pair { font-size: 12px; line-height: 1.3; }
+.chart-x small { font-size: 10px; }
+.legend { display: inline-block; width: 9px; height: 9px; border-radius: 2px; background: var(--expense); margin: 0 3px 0 8px; }
+.legend.inc { background: var(--income); }
+.field textarea.tall { min-height: 220px; line-height: 1.6; }
+.field.search input { background: var(--card); border-color: transparent; font-size: 15px; }
+.tabbar button { font-size: 10.5px; }
+.bar-row { grid-template-columns: 70px 1fr auto; }
+.bar-row > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar-row .num { white-space: nowrap; font-size: 12px; }
+.bar-row { grid-template-columns: 76px 1fr 116px; }
