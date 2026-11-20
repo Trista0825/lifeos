@@ -1,6 +1,6 @@
 // LifeOS Service Worker：快取 App 外殼，讓 App 可以離線開啟。
 // 每次更新前端檔案時，把 CACHE 的版本號 +1，使用者下次開啟就會拿到新版。
-const CACHE = 'lifeos-v3';
+const CACHE = 'lifeos-v4';
 const SHELL = [
   './',
   'index.html',
@@ -29,7 +29,8 @@ self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET' || url.origin !== location.origin) return;
   // 網路優先、失敗時用快取：有網路時永遠拿最新版，沒網路時照樣能開
   e.respondWith(
-    fetch(e.request)
+    // cache: 'no-cache' 讓瀏覽器每次都向 GitHub 確認有沒有新版，更新會立刻生效
+    fetch(e.request.url, { cache: 'no-cache' })
       .then(res => {
         const copy = res.clone();
         caches.open(CACHE).then(c => c.put(e.request, copy));
