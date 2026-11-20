@@ -75,6 +75,9 @@
 |---|---|
 | 今天 | 今日行程、例行公事打卡、今天與逾期待辦、本月收支、快速記帳／待辦／行程／日記 |
 | 記帳・總覽 | 收入／支出／結餘、比上月、日平均、共同支出、每日支出圖、支出／收入類別、支付方式、近 6 個月趨勢（**不含帳戶互轉**） |
+| 記帳・報表 | 帳戶餘額（不含信用卡，可展開看收支類別）、信用卡費、前月帳戶餘額對帳（差額＝1 號餘額−前月結餘）、共同生活開銷 |
+| 記帳・扣款 | 固定扣款（信用卡、貸款…）：每月扣款清單與狀態、各扣款帳戶「目前餘額／待扣／扣完剩」與不足提醒、信用卡本期刷卡合計；扣款日與結帳日顯示在行事曆 |
+| 月初對帳 | 記帳 → 報表 →「開始對帳」（每月 1–10 號今天頁也會提醒）：填各帳戶實際餘額，自動建立／更新期初餘額，列出有差額帳戶的上月明細 |
 | 記帳・明細 | 依日期分組的全部紀錄（**含帳戶互轉**，標示「不計入總覽」），點一筆可編輯／刪除 |
 | 待辦 | 依「逾期／今天／接下來／未排日期」分組；可設優先度與**重複**（完成後自動建立下一次） |
 | 行事曆 | 月曆（藍點＝行程、橘點＝待辦到期）；行程可設全天、時段、**每天／每週／每月／每年重複**與結束日 |
@@ -82,12 +85,36 @@
 | 筆記 | 「筆記」可釘選、加標籤；「日記」每天一篇、可記心情；兩者都能搜尋 |
 
 - 右下角 **＋** 會依目前頁面新增對應項目。
+- 記一筆可選「支出／收入／**轉帳**」：轉帳一次建立轉出、轉入兩筆，修改刪除也會一起；報表有「帳戶互轉檢查」找出只記了一邊的轉帳。
+- 記帳表單上方有**常用按鈕**：釘選的優先，其餘依最常記的項目自動產生；在設定頁管理。
 - **離線也能新增和修改**：右上角會顯示「離線・N 筆待上傳」，連上網路後自動上傳。
 - 想讓總覽再排除其他類別（例如各種「餘額」），在 `app.js` 開頭的 `DASH_EXCLUDE` 加上類別名稱即可。
 - 回到 App 時會自動同步；右上 ⟳ 可手動同步。
 - 也可以直接在試算表裡看資料、做樞紐分析或匯出。
 
 ---
+
+## 匯入刷卡／電子支付截圖（Gemini 辨識）
+
+**設定（只要一次）**
+1. 到 Google AI Studio（aistudio.google.com）登入 → 「Get API key」→ 建立金鑰 → 複製。
+2. Apps Script 編輯器左側 ⚙「專案設定」→ 最下面「指令碼屬性」→「新增指令碼屬性」：
+   屬性 `GEMINI_API_KEY`，值貼上金鑰 → 儲存。
+3. 函式選單選 **`testGemini`** → 執行。會要求新的授權（「連線到外部服務」），允許後在執行紀錄看到「✅ Gemini 可以使用」。
+4. 部署 → 管理部署作業 → ✏ 編輯 → 新版本 → 部署。
+5. （選用）想指定模型：再新增指令碼屬性 `GEMINI_MODEL`，例如 `gemini-3.7-flash`。沒設定時會自動依序嘗試新到舊的 Flash 模型。
+
+**使用**：記帳 → 明細 →「📷 匯入刷卡／電子支付截圖」
+1. 先選這是哪個帳戶的截圖（或「讓 App 自動判斷」）→ 選截圖（可多張）。
+2. 確認畫面：可改日期、內容、金額、類型、類別、勾共同；取消勾選不要的。
+   - 已經記過的（同金額、日期差 1 天內）會標「可能已記過」並預設不勾。
+   - 沒年份的自動補成最近的年份；截圖看不到日期的標紅，要補上才能匯入。
+   - 刷卡回饋／退款 → 記成這張卡的收入「刷卡回饋」，卡費預估會自動扣掉。
+   - 電子錢包「從銀行儲值」→ 記成轉帳（銀行 → 錢包）。
+   - 自動判斷帳戶的順序：之前記住的末四碼 → 截圖上的銀行／錢包名稱 → 跟你已記的帳比對推測。
+3. 按「匯入勾選的 N 筆」。有末四碼的卡，會記住對應的帳戶，下次自動帶入（存在這台裝置）。
+
+注意：Gemini 免費額度送出的內容可能被 Google 用來改善產品；不想這樣可在 AI Studio 綁定付費帳戶。
 
 ## 從 v1 更新到 v2
 
@@ -114,11 +141,13 @@
 
 | 工作表 | 欄位 |
 |---|---|
-| Transactions | id, date, type(income/expense), amount, category, account, note, createdAt, updatedAt |
+| Transactions | id, date, type(income/expense), amount, category, account, note, createdAt, updatedAt, link（轉帳兩筆共用） |
 | Tasks | id, title, note, due, priority(1一般/2中/3高), done, doneAt, createdAt, updatedAt, repeat |
 | Events | id, title, date, start, end, allDay, location, note, createdAt, updatedAt, repeat, repeatUntil |
 | Routines | id, name, days(0=日…6=六，如 `12345`=平日), active, sort, createdAt, updatedAt |
 | RoutineLogs | id, routineId, date, createdAt（有一筆＝當天完成） |
+| Bills | id, name, kind(card/fixed), card, payAccount, closeDay, dueDay, dueOffset(0當月/1次月), amount, category, recordNote, overrides(各月實際金額 JSON), active, sort, createdAt, updatedAt |
+| Quick | id, name, type, amount, category, account, shared, sort, createdAt, updatedAt（釘選的常用按鈕） |
 | Notes | id, kind(note/diary), title, content, date, mood, tags, pinned, createdAt, updatedAt |
 
 repeat：`daily` / `weekly` / `monthly` / `yearly`（空白＝不重複）。每月 31 號的項目在小月會對齊到月底。

@@ -1,7 +1,7 @@
 /* LifeOS 前端 — 原生 JavaScript，不需要編譯 */
 'use strict';
 
-const APP_VERSION = '2.3.0';
+const APP_VERSION = '2.4.0';
 const ENTITIES = ['Transactions', 'Tasks', 'Events', 'Routines', 'RoutineLogs', 'Notes', 'Bills', 'Quick'];
 
 // 選項來自原本的記帳小程序；清單只是建議，輸入框仍可打清單以外的新值
@@ -49,7 +49,7 @@ const REPEAT_OPTS = [['', '不重複'], ['daily', '每天'], ['weekly', '每週'
 const REPEAT_LABEL = Object.fromEntries(REPEAT_OPTS);
 const MOODS = [['', '—'], ['😄', '😄 很好'], ['🙂', '🙂 不錯'], ['😐', '😐 普通'], ['😔', '😔 低落'], ['😫', '😫 很累']];
 const DOW = ['日', '一', '二', '三', '四', '五', '六'];
-const TITLES = { today: '今天', money: '記帳', tasks: '待辦', calendar: '行事曆', routines: '習慣', notes: '筆記', settings: '設定', reconcile: '月初對帳' };
+const TITLES = { import: '匯入截圖', today: '今天', money: '記帳', tasks: '待辦', calendar: '行事曆', routines: '習慣', notes: '筆記', settings: '設定', reconcile: '月初對帳' };
 
 /* ───────── 狀態 ───────── */
 const S = {
@@ -708,8 +708,9 @@ function billInfo(b, ym) {
   let cycle = null, swipes = [], estimate = 0, closed = false;
   if (b.kind === 'card') {
     cycle = billCycle(b, ym);
-    swipes = S.data.Transactions.filter(t => t.type === 'expense' && String(t.account || '').trim() === b.card && t.date >= cycle.start && t.date <= cycle.end);
-    estimate = sum(swipes);
+    // 信用卡上的支出加總，回饋／退款（記成這張卡的收入）扣掉
+    swipes = S.data.Transactions.filter(t => String(t.account || '').trim() === b.card && t.date >= cycle.start && t.date <= cycle.end);
+    estimate = sum(swipes.filter(t => t.type === 'expense')) - sum(swipes.filter(t => t.type === 'income'));
     closed = today() > cycle.end;
   }
   const planned = hasOv ? Number(ov) : b.kind === 'card' ? estimate : Number(b.amount) || 0;
@@ -815,7 +816,7 @@ function billDetail(id, ym) {
   if (b.kind === 'card') {
     lines.push(`<b>帳單週期</b>：${md(i.cycle.start)} – ${md(i.cycle.end)}（${i.closed ? '已結帳' : '尚未結帳'}）`);
     lines.push(`<b>這期刷卡紀錄</b>：${i.swipes.length} 筆，合計 ${money(i.estimate)}`);
-    i.swipes.sort((a, c) => a.date.localeCompare(c.date)).forEach(t => lines.push(`<span class="muted">・${md(t.date)} ${esc(stripShared(t.note) || t.category)} ${money(t.amount)}</span>`));
+    i.swipes.sort((a, c) => a.date.localeCompare(c.date)).forEach(t => lines.push(`<span class="muted">・${md(t.date)} ${esc(stripShared(t.note) || t.category)} ${t.type === 'income' ? '-' : ''}${money(t.amount)}</span>`));
   }
   lines.push(`<b>扣款</b>：${dateLabel(i.due)} 從 ${esc(b.payAccount)}`);
   if (i.paid) lines.push(`<b class="income">✓ 已記帳扣款 ${money(i.paidAmt)}</b>（${i.paidTx.map(t => md(t.date)).join('、')}）`);
@@ -1086,6 +1087,10 @@ function moneyReports() {
 }
 
 function moneyList() {
+  const importBtn = '<button class="btn secondary import-entry" data-act="openImport">📷 匯入刷卡／電子支付截圖</button>';
+  return importBtn + moneyListBody();
+}
+function moneyListBody() {
   const tx = monthTx(S.moneyMonth)
     .sort((a, b) => b.date.localeCompare(a.date) || String(b.createdAt).localeCompare(String(a.createdAt)));
   if (!tx.length) return '<div class="card"><div class="empty">這個月還沒有記帳，按右下角 ＋ 開始記一筆</div></div>';
@@ -1122,8 +1127,8 @@ function render() {
   $('#pageTitle').textContent = TITLES[v];
   $('#view').innerHTML = VIEWS[v]();
   document.querySelectorAll('.tabbar button').forEach(b => b.classList.toggle('active', b.dataset.view === v));
-  $('#fab').classList.toggle('hidden', v === 'settings' || v === 'reconcile');
-  if (v === 'reconcile') document.querySelector('.tabbar [data-view="money"]').classList.add('active');
+  $('#fab').classList.toggle('hidden', v === 'settings' || v === 'reconcile' || v === 'import');
+  if (v === 'reconcile' || v === 'import') document.querySelector('.tabbar [data-view="money"]').classList.add('active');
   if (search) { const el = $('#noteSearch'); el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
   updateStatus();
 }
@@ -1651,6 +1656,318 @@ const ACTIONS = {
     toast('已刪除');
   },
 };
+
+/* ───────── 匯入截圖（Gemini 辨識） ───────── */
+const WALLETS = ['line pay', 'IPass money', '支付寶'];
+// 畫面上的銀行名稱 → 你的帳戶名稱用的簡稱
+const BANK_ALIASES = [['國泰世華', '國泰'], ['國泰', '國泰'], ['台新', '台新'], ['富邦', '富邦'], ['聯邦', '聯邦'], ['中國信託', '中信'], ['中信', '中信'],
+['玉山', '玉山'], ['第一', '第一'], ['永豐', '永豐'], ['上海', '上海'], ['安泰', '安泰'], ['王道', '王道']];
+const REBATE_CAT = '刷卡回饋';
+const IMP = { batches: [], account: localStorage.getItem('lifeos.impAccount') || '' };
+
+function isWallet(a) { return WALLETS.includes(String(a || '').trim()); }
+function bankShort(name) {
+  const n = String(name || '');
+  const hit = BANK_ALIASES.find(([k]) => n.includes(k));
+  return hit ? hit[1] : null;
+}
+function bankToAccount(name) { const s = bankShort(name); return s ? s + '帳戶' : ''; }
+function issuerToAccount(src) {
+  const iss = String((src && src.issuer) || '') + ' ' + String((src && src.appTitle) || '');
+  if (/line\s*pay/i.test(iss)) return 'line pay';
+  if (/ipass|一卡通/i.test(iss)) return 'IPass money';
+  if (/支付寶/.test(iss)) return '支付寶';
+  const s = bankShort(src && src.issuer);
+  if (!s) return '';
+  return (src.kind === 'bank_account' ? s + '帳戶' : s + '信用卡');
+}
+function last4Map() { return loadJSON('lifeos.last4', {}); }
+function importAccountOptions() {
+  const seen = S.data.Transactions.map(t => String(t.account || '').trim()).filter(Boolean);
+  const cards = uniq(PAY_METHODS.filter(isCard).concat(seen.filter(isCard)));
+  const wallets = uniq(WALLETS.concat(seen.filter(isWallet)));
+  const banks = uniq(BANKS.concat(seen).filter(a => !isCard(a) && !isWallet(a)));
+  return { cards, wallets, banks };
+}
+function accountSelect(id, value, attrs) {
+  const o = importAccountOptions();
+  const opt = a => `<option value="${esc(a)}" ${a === value ? 'selected' : ''}>${esc(a)}</option>`;
+  return `<select id="${id}" ${attrs || ''}><option value="" ${!value ? 'selected' : ''}>讓 App 自動判斷</option>
+    <optgroup label="信用卡">${o.cards.map(opt).join('')}</optgroup>
+    <optgroup label="電子支付">${o.wallets.map(opt).join('')}</optgroup>
+    <optgroup label="銀行帳戶">${o.banks.map(opt).join('')}</optgroup></select>`;
+}
+// 沒有年份時：取「今天往前最近的那個日期」
+function inferYear(m, d) {
+  const t = today(), y = Number(t.slice(0, 4));
+  const cand = y + '-' + pad(m) + '-' + pad(d);
+  return cand > addDays(t, 7) ? y - 1 : y;
+}
+function dayDiff(a, b) { return Math.round((parseYmd(a) - parseYmd(b)) / 86400000); }
+// 已經記過的帳：同金額、日期差 1 天內；同帳戶最可信，其他帳戶也提醒
+function findDup(it, account) {
+  if (!it.date || !(it.amount > 0)) return null;
+  const accts = it.type === 'transfer' ? [it.from, it.to] : [account];
+  const near = S.data.Transactions.filter(t => Math.round(t.amount) === Math.round(it.amount) && Math.abs(dayDiff(t.date, it.date)) <= 1 && !isOpening(t));
+  const strong = near.find(t => accts.includes(String(t.account || '').trim()));
+  const any = strong || near.find(t => t.date === it.date);
+  if (!any) return null;
+  return { strong: !!strong, text: `${md(any.date)} ${any.account} ${stripShared(any.note) || any.category} ${money(any.amount)}` };
+}
+// 用「跟已記帳的資料比對」推測是哪個帳戶
+function guessAccountByHistory(items) {
+  const tally = {};
+  items.forEach(it => {
+    if (!it.date || it.type === 'transfer') return;
+    S.data.Transactions.filter(t => t.date === it.date && Math.round(t.amount) === Math.round(it.amount) && !isOpening(t) && t.category !== TRANSFER_CAT)
+      .forEach(t => { const a = String(t.account || '').trim(); (tally[a] = tally[a] || []).push(t); });
+  });
+  const best = Object.entries(tally).sort((a, b) => b[1].length - a[1].length)[0];
+  if (!best) return null;
+  const t = best[1][0];
+  return { account: best[0], reason: `你已記的 ${md(t.date)}「${stripShared(t.note) || t.category}」${money(t.amount)} 是用${best[0]}` };
+}
+
+function buildItems(batch) {
+  const isCardAcct = isCard(batch.account);
+  return (batch.raw.items || []).map(r => {
+    const date = r.month && r.day ? (r.year || inferYear(r.month, r.day)) + '-' + pad(r.month) + '-' + pad(r.day) : '';
+    let note = String(r.merchant || '').replace(/\s+/g, ' ').trim();
+    if (r.installment) note += '（' + r.installment + '）';
+    const it = { date, note, amount: Math.abs(Number(r.amount) || 0), shared: false, raw: r, truncated: !!r.truncated, yearGuessed: !r.year && !!date };
+    const cats = r.direction === 'income' || r.direction === 'refund' ? INCOME_CATS : EXPENSE_CATS;
+    const cat = cats.includes(r.category) ? r.category : '其他';
+    switch (r.direction) {
+      case 'topup':
+        Object.assign(it, { type: 'transfer', from: bankToAccount(r.counterparty), to: batch.account, category: TRANSFER_CAT });
+        break;
+      case 'refund':
+        Object.assign(it, { type: 'income', category: isCardAcct ? REBATE_CAT : cat });
+        break;
+      case 'income':
+        Object.assign(it, { type: 'income', category: cat });
+        break;
+      default: // expense / fee / transfer_out
+        Object.assign(it, { type: 'expense', category: cat });
+    }
+    return it;
+  });
+}
+function refreshDups(batch) {
+  batch.items.forEach(it => {
+    if (it.type === 'transfer') it.to = it.to || batch.account;
+    it.dup = findDup(it, batch.account);
+    if (it.sel === undefined) it.sel = !it.dup;
+  });
+}
+function resolveAccount(batch) {
+  const src = batch.raw.source || {};
+  const detected = issuerToAccount(src);
+  const byLast4 = src.last4 ? last4Map()[src.last4] : '';
+  if (batch.chosen) {
+    batch.account = batch.chosen;
+    const other = byLast4 || detected;
+    if (other && other !== batch.chosen) batch.warn = `你選的是「${batch.chosen}」，但截圖看起來是「${other}」（${byLast4 ? '末四碼 ' + src.last4 + ' 之前對應的帳戶' : src.evidence}），請確認`;
+    return;
+  }
+  if (byLast4) { batch.account = byLast4; batch.reason = `末四碼 ${src.last4}（之前匯入時記下的）`; return; }
+  if (detected) { batch.account = detected; batch.reason = src.evidence || '截圖上的文字'; return; }
+  batch.account = '';
+  batch.items = buildItems(batch);
+  const g = guessAccountByHistory(batch.items);
+  if (g) { batch.account = g.account; batch.reason = '推測：' + g.reason; batch.guessed = true; }
+}
+
+function compressImage(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      const max = 2000, scale = Math.min(1, max / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      const data = c.toDataURL('image/jpeg', 0.85);
+      const t = document.createElement('canvas');
+      const ts = 160 / img.width;
+      t.width = 160; t.height = Math.round(img.height * ts);
+      t.getContext('2d').drawImage(img, 0, 0, t.width, t.height);
+      URL.revokeObjectURL(url);
+      resolve({ base64: data.split(',')[1], thumb: t.toDataURL('image/jpeg', 0.7) });
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('無法讀取這張圖片')); };
+    img.src = url;
+  });
+}
+
+async function handleImportFiles(files) {
+  const chosen = IMP.account;
+  const list = Array.from(files || []);
+  for (const f of list) {
+    const batch = { id: uid(), name: f.name, status: 'loading', chosen, items: [] };
+    IMP.batches.unshift(batch);
+    renderImport();
+    try {
+      const img = await compressImage(f);
+      batch.thumb = img.thumb;
+      renderImport();
+      const res = await api({
+        action: 'parseStatement', name: f.name, image: img.base64, mimeType: 'image/jpeg',
+        hint: { today: today(), expenseCats: uniq(EXPENSE_CATS.concat(['貸款'])), incomeCats: INCOME_CATS.concat([REBATE_CAT]) }
+      });
+      batch.raw = res.data;
+      resolveAccount(batch);
+      batch.items = buildItems(batch);
+      refreshDups(batch);
+      batch.status = 'done';
+    } catch (err) {
+      batch.status = 'error';
+      batch.error = err.network ? '需要網路才能辨識截圖' : err.message;
+    }
+    renderImport();
+  }
+}
+
+function importRow(b, it, i) {
+  const k = `data-b="${b.id}" data-i="${i}"`;
+  const bad = it.sel && (!it.date || !(it.amount > 0) || (it.type === 'transfer' ? !it.from || !it.to : !b.account));
+  const flags = [
+    !it.date ? '<span class="tag overdue">⚠ 截圖看不到日期，請補上</span>' : '',
+    it.yearGuessed ? '<span class="tag muted">年份自動補</span>' : '',
+    it.truncated ? '<span class="tag muted">名稱被截斷</span>' : '',
+    it.dup ? `<span class="tag ${it.dup.strong ? 'overdue' : 'p2'}">可能已記過：${esc(it.dup.text)}</span>` : '',
+  ].filter(Boolean);
+  return `<div class="imp-row ${it.sel ? '' : 'off'} ${bad ? 'bad' : ''}">
+    <div class="imp-line">
+      <input type="checkbox" class="imp-f" ${k} data-f="sel" ${it.sel ? 'checked' : ''} aria-label="匯入這筆">
+      <input class="imp-f imp-note" ${k} data-f="note" value="${esc(it.note)}" aria-label="內容">
+      <input type="number" inputmode="decimal" class="imp-f imp-amt ${it.type}" ${k} data-f="amount" value="${it.amount}" aria-label="金額">
+    </div>
+    <div class="imp-line sub">
+      <input type="date" class="imp-f imp-date ${it.date ? '' : 'missing'}" ${k} data-f="date" value="${esc(it.date)}" aria-label="日期">
+      <select class="imp-f" ${k} data-f="type">
+        <option value="expense" ${it.type === 'expense' ? 'selected' : ''}>支出</option>
+        <option value="income" ${it.type === 'income' ? 'selected' : ''}>${isCard(b.account) ? '回饋/退款' : '收入'}</option>
+        <option value="transfer" ${it.type === 'transfer' ? 'selected' : ''}>轉帳</option>
+      </select>
+    </div>
+    <div class="imp-line sub">
+      ${it.type === 'transfer'
+      ? `<input class="imp-f" ${k} data-f="from" list="impAccts" value="${esc(it.from)}" placeholder="轉出帳戶"><span>→</span><input class="imp-f" ${k} data-f="to" list="impAccts" value="${esc(it.to)}" placeholder="轉入帳戶">`
+      : `<input class="imp-f imp-cat" ${k} data-f="category" list="impCats_${it.type}" value="${esc(it.category)}">
+           <label class="imp-shared"><input type="checkbox" class="imp-f" ${k} data-f="shared" ${it.shared ? 'checked' : ''}>共同</label>`}
+    </div>
+    ${flags.length ? `<div class="imp-flags">${flags.join(' ')}</div>` : ''}
+  </div>`;
+}
+
+function importBatchCard(b) {
+  if (b.status === 'loading') return `<div class="card imp-batch"><div class="imp-head">${b.thumb ? `<img src="${b.thumb}" alt="">` : ''}<div><b>${esc(b.name)}</b><div class="help">辨識中…（約 5–20 秒）</div></div></div></div>`;
+  if (b.status === 'error') return `<div class="card imp-batch"><div class="imp-head">${b.thumb ? `<img src="${b.thumb}" alt="">` : ''}<div><b>${esc(b.name)}</b>
+    <div class="alert warn" style="margin:6px 0 0">${esc(b.error)}</div></div></div><button class="btn danger" data-act="impRemove" data-b="${b.id}">移除</button></div>`;
+  const src = b.raw.source || {};
+  const n = b.items.filter(x => x.sel).length;
+  return `<div class="card imp-batch">
+    <div class="imp-head">${b.thumb ? `<img src="${b.thumb}" alt="">` : ''}
+      <div style="flex:1;min-width:0">
+        <b>${esc(b.name)}</b> <span class="muted">· ${b.items.length} 筆${src.last4 ? ' · 末四碼 ' + esc(src.last4) : ''}</span>
+        <div class="field" style="margin:6px 0 0"><label>帳戶${b.account ? '' : '（請選擇）'}</label>${accountSelect('', b.account, `class="imp-acct ${b.account ? '' : 'missing'}" data-b="${b.id}"`)}</div>
+        ${b.reason ? `<div class="help">${b.guessed ? '🔎 ' : '✓ '}${esc(b.reason)}</div>` : ''}
+        ${b.warn ? `<div class="alert warn" style="margin:6px 0 0">${esc(b.warn)}</div>` : ''}
+      </div></div>
+    ${b.items.map((it, i) => importRow(b, it, i)).join('')}
+    <div class="imp-actions"><span class="muted">已勾選 ${n} 筆</span><button class="chip" data-act="impRemove" data-b="${b.id}">移除這張</button></div>
+  </div>`;
+}
+
+VIEWS.import = function () {
+  const total = IMP.batches.filter(b => b.status === 'done').reduce((s, b) => s + b.items.filter(x => x.sel).length, 0);
+  return `
+    <div class="toolbar"><button class="chip" data-act="impBack">‹ 返回記帳</button></div>
+    <div class="card">
+      <div class="field"><label>① 這是哪個帳戶的截圖？</label>${accountSelect('impAccount', IMP.account)}</div>
+      <label class="btn" for="impFile" style="display:block;text-align:center">② 選擇截圖（可一次選多張）</label>
+      <input id="impFile" type="file" accept="image/*" multiple hidden>
+      <p class="help">Gemini 會讀出每一筆的日期、商家、金額。匯入前你可以修改、取消勾選；已經記過的會自動標出來並預設不勾。刷卡回饋會記成這張卡的「${REBATE_CAT}」，自動從卡費扣掉；電子錢包的儲值會記成轉帳。</p>
+    </div>
+    <datalist id="impCats_expense">${EXPENSE_CATS.map(c => `<option value="${esc(c)}">`).join('')}</datalist>
+    <datalist id="impCats_income">${uniq(INCOME_CATS.concat([REBATE_CAT])).map(c => `<option value="${esc(c)}">`).join('')}</datalist>
+    <datalist id="impAccts">${uniq(importAccountOptions().banks.concat(importAccountOptions().wallets)).map(c => `<option value="${esc(c)}">`).join('')}</datalist>
+    <div id="impBatches">${IMP.batches.map(importBatchCard).join('')}</div>
+    ${total ? `<div class="imp-bar"><button class="btn" data-act="impCommit">匯入勾選的 ${total} 筆</button></div>` : ''}`;
+};
+function renderImport() { if (S.view === 'import') render(); }
+
+function commitImport() {
+  const errs = [];
+  let n = 0;
+  IMP.batches.filter(b => b.status === 'done').forEach(b => {
+    b.items.forEach(it => {
+      if (!it.sel) return;
+      if (!it.date) errs.push(`「${it.note}」沒有日期`);
+      else if (!(Number(it.amount) > 0)) errs.push(`「${it.note}」金額不正確`);
+      else if (it.type === 'transfer' ? (!it.from || !it.to || it.from === it.to) : !b.account) errs.push(it.type === 'transfer' ? `「${it.note}」轉帳帳戶不完整` : `${b.name} 還沒選帳戶`);
+    });
+  });
+  if (errs.length) { toast(uniq(errs)[0] + (errs.length > 1 ? `（還有 ${errs.length - 1} 個問題）` : ''), true); renderImport(); return; }
+  IMP.batches.filter(b => b.status === 'done').forEach(b => {
+    b.items.filter(it => it.sel).forEach(it => {
+      if (it.type === 'transfer') {
+        saveTransfer({ amount: Number(it.amount), from: it.from, to: it.to, date: it.date, note: it.note });
+      } else {
+        const base = stripShared(it.note);
+        createRec('Transactions', {
+          type: it.type, amount: Number(it.amount), category: String(it.category || '').trim() || '其他',
+          date: it.date, account: b.account, note: it.shared ? base + SHARED_SUFFIX : base
+        });
+      }
+      n++;
+    });
+    const l4 = b.raw.source && b.raw.source.last4;
+    if (l4 && b.account) { const m = last4Map(); m[l4] = b.account; saveJSON('lifeos.last4', m); }
+  });
+  IMP.batches = IMP.batches.filter(b => b.status === 'loading');
+  render();
+  toast(`已匯入 ${n} 筆`);
+}
+
+Object.assign(ACTIONS, {
+  openImport: () => go('import'),
+  impBack: () => { S.moneyMode = 'list'; go('money'); },
+  impRemove: el => { IMP.batches = IMP.batches.filter(b => b.id !== el.dataset.b); render(); },
+  impCommit: () => commitImport(),
+});
+document.addEventListener('change', e => {
+  const el = e.target;
+  if (el.id === 'impAccount') { IMP.account = el.value; localStorage.setItem('lifeos.impAccount', el.value); return; }
+  if (el.id === 'impFile') { handleImportFiles(el.files); el.value = ''; return; }
+  if (el.classList.contains('imp-acct')) {
+    const b = IMP.batches.find(x => x.id === el.dataset.b);
+    b.account = el.value; b.chosen = el.value; b.reason = ''; b.guessed = false; b.warn = '';
+    b.items.forEach(it => { if (it.type === 'transfer' && !isCard(b.account)) it.to = b.account; delete it.sel; });
+    refreshDups(b);
+    render();
+    return;
+  }
+  if (el.classList.contains('imp-f') && ['sel', 'type', 'shared', 'date'].includes(el.dataset.f)) {
+    impField(el);
+    if (el.dataset.f === 'type') {
+      const it = IMP.batches.find(x => x.id === el.dataset.b).items[Number(el.dataset.i)];
+      if (it.type === 'transfer') { it.category = TRANSFER_CAT; it.to = it.to || IMP.batches.find(x => x.id === el.dataset.b).account; }
+      else if (it.category === TRANSFER_CAT || (it.type === 'expense' && it.category === REBATE_CAT)) it.category = '其他';
+    }
+    render();
+  }
+});
+document.addEventListener('input', e => { if (e.target.classList.contains('imp-f') && !['sel', 'type', 'shared'].includes(e.target.dataset.f)) impField(e.target); });
+function impField(el) {
+  const b = IMP.batches.find(x => x.id === el.dataset.b);
+  if (!b) return;
+  const it = b.items[Number(el.dataset.i)];
+  const f = el.dataset.f;
+  it[f] = el.type === 'checkbox' ? el.checked : f === 'amount' ? Number(el.value) : el.value;
+  if (f === 'date' || f === 'amount') { it.dup = findDup(it, b.account); it.yearGuessed = false; }
+}
 
 /* ───────── 事件綁定 ───────── */
 document.addEventListener('click', e => {

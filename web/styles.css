@@ -1140,3 +1140,158 @@ button {
 .card h3 a {
   font-size: 13px;
 }
+
+/* 匯入截圖 */
+.import-entry {
+  margin-bottom: 12px;
+}
+
+.imp-head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  margin-bottom: 8px;
+}
+
+.imp-head img {
+  width: 64px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+.imp-head select {
+  width: 100%;
+  padding: 9px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+
+.imp-head select.missing {
+  border-color: var(--expense);
+}
+
+.imp-row {
+  border-top: 1px solid var(--line);
+  padding: 8px 0;
+}
+
+.imp-row.off {
+  opacity: .5;
+}
+
+.imp-row.bad {
+  background: rgba(224, 83, 61, .07);
+}
+
+.imp-line {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.imp-line.sub {
+  margin-top: 6px;
+  padding-left: 28px;
+}
+
+.imp-line input,
+.imp-line select {
+  font: inherit;
+  font-size: 14px;
+  padding: 6px 7px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+  min-width: 0;
+}
+
+.imp-line input[type=checkbox] {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+.imp-date {
+  width: 128px;
+  flex-shrink: 0;
+}
+
+.imp-date.missing {
+  border-color: var(--expense) !important;
+  background: rgba(224, 83, 61, .08) !important;
+}
+
+.imp-note {
+  flex: 1;
+}
+
+.imp-amt {
+  width: 76px;
+  text-align: right;
+  flex-shrink: 0;
+  font-weight: 600;
+}
+
+.imp-amt.income {
+  color: var(--income);
+}
+
+.imp-cat {
+  flex: 1;
+}
+
+.imp-line.sub input:not([type=checkbox]) {
+  flex: 1;
+}
+
+.imp-shared {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.imp-flags {
+  padding-left: 28px;
+  margin-top: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.imp-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  font-size: 13px;
+}
+
+.imp-bar {
+  position: sticky;
+  bottom: calc(var(--tabbar-h) + var(--safe-b) + 10px);
+  z-index: 12;
+}
+
+.imp-bar .btn {
+  box-shadow: 0 6px 18px rgba(79, 107, 237, .35);
+}
+
+.imp-line.sub .imp-date {
+  flex: 0 0 140px;
+}
+
+.imp-line.sub select {
+  flex: 0 0 auto;
+}
+
+.imp-line.sub {
+  margin-top: 5px;
+}
