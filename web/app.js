@@ -1,7 +1,7 @@
 /* LifeOS 前端 — 原生 JavaScript，不需要編譯 */
 'use strict';
 
-const APP_VERSION = '2.5.0';
+const APP_VERSION = '2.6.0';
 const ENTITIES = ['Transactions', 'Tasks', 'Events', 'Routines', 'RoutineLogs', 'Notes', 'Bills', 'Quick'];
 
 // 選項來自原本的記帳小程序；清單只是建議，輸入框仍可打清單以外的新值
@@ -61,6 +61,7 @@ const S = {
   moneyMode: 'dash',
   moneyMonth: ymd(new Date()).slice(0, 7),
   recMonth: ymd(new Date()).slice(0, 7),
+  listAcct: '', // 明細篩選的帳戶（空白＝全部）
   calMonth: ymd(new Date()).slice(0, 7),
   calSel: ymd(new Date()),
   taskFilter: 'open',
@@ -365,8 +366,15 @@ function eventItem(e) {
       ${sub ? `<div class="sub">${esc(sub)}</div>` : ''}
     </div></li>`;
 }
-function txItem(t) {
+function txItem(t, focus) {
   const pr = transferPair(t);
+  if (focus && pr && pr.out && pr.in) { // 篩選單一帳戶時：轉帳兩邊各自顯示，標出方向
+    const out = t.type === 'expense';
+    return `<li class="item"><div class="main" data-act="editTx" data-id="${t.id}">
+      <div class="title">${out ? '轉出 → ' + esc(pr.in.account) : '轉入 ← ' + esc(pr.out.account)}</div>
+      <div class="sub">轉帳${t.note && t.note !== TRANSFER_CAT ? ' · ' + esc(t.note) : ''}</div></div>
+      <div class="amount ${out ? 'expense' : 'income'}">${out ? '-' : '+'}${money(t.amount)}</div></li>`;
+  }
   if (pr && pr.out && pr.in && t.type === 'expense') {
     return `<li class="item"><div class="main" data-act="editTx" data-id="${t.id}">
       <div class="title">轉帳 <span class="tag muted">不計入總覽</span></div>
@@ -1026,6 +1034,10 @@ function bySum(arr, keyFn) {
   return g;
 }
 
+function listLink(acct) {
+  return `<div class="sub-row"><a class="link" data-act="listAcct" data-acct="${esc(acct)}">看 ${esc(acct)} 的完整明細 ›</a></div>`;
+}
+
 function moneyReports() {
   const m = S.moneyMonth;
   const tx = monthTx(m);
@@ -1043,7 +1055,7 @@ function moneyReports() {
       const g = groupSum(arr.filter(t => t.type === type), 'category').map(([k, v]) => [k, type === 'income' ? v : -v]);
       return g.length ? `<div class="sub-head">${label}</div>${subRows(g)}` : '';
     };
-    return drill(a, sum(arr.map(t => ({ amount: signed(t) }))), part('expense', '支出') + part('income', '收入'));
+    return drill(a, sum(arr.map(t => ({ amount: signed(t) }))), part('expense', '支出') + part('income', '收入') + listLink(a));
   }).join('')}
     ${reportTotal('總和', balTotal)}</div>`;
 
@@ -1052,7 +1064,7 @@ function moneyReports() {
   const byCard = bySum(cardTx, t => t.account);
   const cardCard = `<div class="card report"><h3>信用卡費</h3>
     ${Object.keys(byCard).length ? Object.entries(byCard).sort((a, b) => sum(b[1]) - sum(a[1]))
-      .map(([c, arr]) => drill(c, -sum(arr), itemRows(arr))).join('') + reportTotal('總和', -sum(cardTx))
+      .map(([c, arr]) => drill(c, -sum(arr), itemRows(arr) + listLink(c))).join('') + reportTotal('總和', -sum(cardTx))
       : '<div class="empty">這個月沒有刷卡</div>'}</div>`;
 
   // 3. 前月帳戶餘額：上個月各帳戶結餘 vs 這個月 1 號登記的餘額
@@ -1090,16 +1102,55 @@ function moneyList() {
   const importBtn = '<button class="btn secondary import-entry" data-act="openImport">📷 匯入截圖／📋 貼上明細</button>';
   return importBtn + moneyListBody();
 }
+function acctOf(t) { return String(t.account || '').trim() || '（未填帳戶）'; }
+
+// 明細的帳戶篩選選單：只列這個月有紀錄的帳戶（含筆數），依信用卡／電子支付／銀行帳戶分組
+function listAcctSelect(tx) {
+  const cnt = {};
+  tx.forEach(t => { const a = acctOf(t); cnt[a] = (cnt[a] || 0) + 1; });
+  if (S.listAcct && !cnt[S.listAcct]) cnt[S.listAcct] = 0;
+  const names = Object.keys(cnt).sort(acctOrder);
+  const opt = a => `<option value="${esc(a)}" ${a === S.listAcct ? 'selected' : ''}>${esc(a)}（${cnt[a]}）</option>`;
+  const grp = (label, arr) => arr.length ? `<optgroup label="${label}">${arr.map(opt).join('')}</optgroup>` : '';
+  const cards = names.filter(isCard), wallets = names.filter(a => !isCard(a) && isWallet(a)), banks = names.filter(a => !isCard(a) && !isWallet(a));
+  return `<div class="list-filter">
+    <select id="listAcct" aria-label="篩選帳戶"><option value="" ${!S.listAcct ? 'selected' : ''}>全部帳戶（${tx.length}）</option>
+      ${grp('信用卡（支付方式）', cards)}${grp('電子支付', wallets)}${grp('銀行帳戶／現金', banks)}</select>
+    ${S.listAcct ? '<button class="chip" data-act="listAcctClear">清除</button>' : ''}</div>`;
+}
+
+// 篩選後最上面的小計
+function listAcctSummary(a, arr) {
+  const exp = sum(arr.filter(t => t.type === 'expense'));
+  const inc = sum(arr.filter(t => t.type === 'income'));
+  const stat = (label, v, cls) => `<div class="stat"><div class="label">${label}</div><div class="value ${cls || ''}">${v}</div></div>`;
+  if (isCard(a)) {
+    return `<div class="stats" style="margin-bottom:12px">
+      ${stat('刷卡', money(exp), 'expense')}${stat('回饋／退款', money(inc), 'income')}${stat('本月淨額', money(exp - inc))}</div>`;
+  }
+  const opening = sum(arr.filter(isOpening));
+  const tin = sum(arr.filter(t => t.type === 'income' && !isOpening(t)));
+  return `<div class="stats four" style="margin-bottom:12px">
+    ${stat('期初餘額', money(opening))}${stat('收入／轉入', money(tin), 'income')}${stat('支出／轉出', money(exp), 'expense')}${stat('目前結餘', money(opening + tin - exp))}</div>`;
+}
+
 function moneyListBody() {
-  const tx = monthTx(S.moneyMonth)
+  const all = monthTx(S.moneyMonth)
     .sort((a, b) => b.date.localeCompare(a.date) || String(b.createdAt).localeCompare(String(a.createdAt)));
-  if (!tx.length) return '<div class="card"><div class="empty">這個月還沒有記帳，按右下角 ＋ 開始記一筆</div></div>';
+  if (!all.length) return '<div class="card"><div class="empty">這個月還沒有記帳，按右下角 ＋ 開始記一筆</div></div>';
+  const f = S.listAcct;
+  const tx = f ? all.filter(t => acctOf(t) === f) : all;
+  const head = listAcctSelect(all) + (f ? listAcctSummary(f, tx) : '');
+  if (!tx.length) return head + `<div class="card"><div class="empty">${esc(f)} 這個月沒有紀錄</div></div>`;
   const groups = {};
   tx.forEach(x => (groups[x.date] = groups[x.date] || []).push(x));
-  return Object.entries(groups).map(([d, arr]) => {
-    const out = sum(arr.filter(x => x.type === 'expense' && counted(x)));
-    return `<div class="group-head"><span>${dateLabel(d)}</span><span>${out ? '支出 ' + money(out) : ''}</span></div>
-      <div class="card tight">${list(arr.map(txItem), '')}</div>`;
+  return head + Object.entries(groups).map(([d, arr]) => {
+    // 全部：當天支出（不含互轉）；單一帳戶：當天這個帳戶的進出淨額
+    let right;
+    if (f) { const net = arr.reduce((s2, t) => s2 + signed(t), 0); right = net ? (net > 0 ? '+' : '-') + money(Math.abs(net)) : ''; }
+    else { const out = sum(arr.filter(x => x.type === 'expense' && counted(x))); right = out ? '支出 ' + money(out) : ''; }
+    return `<div class="group-head"><span>${dateLabel(d)}</span><span>${right}</span></div>
+      <div class="card tight">${list(arr.map(t => txItem(t, f)).filter(Boolean), '')}</div>`;
   }).join('');
 }
 
@@ -1551,6 +1602,8 @@ const ACTIONS = {
     else toast(created || updated ? `已儲存（新增 ${created}、更新 ${updated} 筆）` : '沒有變更');
   },
   editQuick: el => quickForm(find('Quick', el.dataset.id)),
+  listAcct: el => { S.listAcct = el.dataset.acct; S.moneyMode = 'list'; render(); window.scrollTo(0, 0); },
+  listAcctClear: () => { S.listAcct = ''; render(); },
   goBills: () => { S.moneyMode = 'bills'; S.moneyMonth = today().slice(0, 7); go('money'); },
   newBill: () => billForm(),
   editBill: el => billForm(find('Bills', el.dataset.id)),
@@ -2066,6 +2119,7 @@ Object.assign(ACTIONS, {
 });
 document.addEventListener('change', e => {
   const el = e.target;
+  if (el.id === 'listAcct') { S.listAcct = el.value; render(); return; }
   if (el.id === 'impAccount') { IMP.account = el.value; localStorage.setItem('lifeos.impAccount', el.value); return; }
   if (el.id === 'impFile') { handleImportFiles(el.files); el.value = ''; return; }
   if (el.classList.contains('imp-acct')) {
