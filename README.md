@@ -78,7 +78,7 @@
 | 記帳・報表 | 帳戶餘額（不含信用卡，可展開看收支類別）、信用卡費、前月帳戶餘額對帳（差額＝1 號餘額−前月結餘）、共同生活開銷 |
 | 記帳・扣款 | 固定扣款（信用卡、貸款…）：每月扣款清單與狀態、各扣款帳戶「目前餘額／待扣／扣完剩」與不足提醒、信用卡本期刷卡合計；扣款日與結帳日顯示在行事曆 |
 | 月初對帳 | 記帳 → 報表 →「開始對帳」（每月 1–10 號今天頁也會提醒）：填各帳戶實際餘額，自動建立／更新期初餘額，列出有差額帳戶的上月明細 |
-| 記帳・明細 | 依日期分組的全部紀錄（**含帳戶互轉**，標示「不計入總覽」），點一筆可編輯／刪除 |
+| 記帳・明細 | 最上面可**篩選帳戶**（支付方式／入帳銀行），列出該帳戶當月明細與小計（信用卡：刷卡、回饋、淨額；帳戶：期初、收入、支出、結餘）。依日期分組的全部紀錄（**含帳戶互轉**，標示「不計入總覽」），點一筆可編輯／刪除 |
 | 待辦 | 依「逾期／今天／接下來／未排日期」分組；可設優先度與**重複**（完成後自動建立下一次） |
 | 行事曆 | 月曆（藍點＝行程、橘點＝待辦到期）；行程可設全天、時段、**每天／每週／每月／每年重複**與結束日 |
 | 習慣 | 設定每週哪幾天要做、每日打卡、近 7 天紀錄、連續天數 🔥，可暫停 |
@@ -93,6 +93,55 @@
 - 也可以直接在試算表裡看資料、做樞紐分析或匯出。
 
 ---
+
+## 共同帳（和伴侶分帳、共同基金、代墊應收）
+
+**在哪裡**：記帳 →「分帳」。今天頁也會顯示累計。
+
+- **各付各的、累計結算**：你記帳勾「和○○共同」→ 共同帳自動一筆（你付、對方分攤一半）；改金額、刪除會同步。
+  也可以在分帳頁直接記，選「對半／全額代付／自訂對方要負擔多少」。
+  最上面是累計「張咘要給你 $X」，按「記錄還款」可還一部分，剩的繼續累計；填了帳戶會同時記到你的個人帳（類別「共同結算」）。
+- **共同基金**：「存入基金」（預設 5000；你存的會記成你個人帳「共同基金」支出）、「用基金付」。顯示餘額、本月各自存多少、累計誰多存。
+- **代墊應收**（同事等）：記帳時勾「幫別人代墊」，可填人數（自動算你的部分）或先空著。
+  分帳頁的「代墊應收」按「收到錢」→ 記成「代墊收回」收入並連到原本那筆；收齊自動結案，人數不定的可手動「結案」。
+- **總覽**：別人還你的錢（代墊收回、共同結算、其他收入(代付)）會從支出扣掉，不算收入。
+- **舊資料**：分帳頁上方會提示 8 月起還沒轉入的「(共同)」，按「檢查並轉入」，可逐筆改成「基金付」或取消。
+
+### 給伴侶用（只看得到共同帳）
+1. 設定 →「共同帳」：填你的稱呼（LINE 回覆和他的畫面會用）和伴侶稱呼 → 儲存。
+2. 按「產生連結」→「複製連結」→ 用 LINE 私訊傳給他。
+3. 他用手機瀏覽器（iPhone 用 Safari）打開 → 自動設定好 → 加入主畫面。
+   他只會看到共同帳；你的個人帳、帳戶、薪資他都看不到（後端擋住，不只是畫面隱藏）。他不能修改你記的項目。
+4. 連結外流時按「重新產生」，舊連結立刻失效。
+
+## LINE 群組自動記帳
+
+張咘在你們的記帳群組傳「晚餐250」或「水果480 娃娃機70」，機器人會自動記成「張咘付、對半」並回覆。
+只記張咘的訊息（你的請在 App 記，避免重複）。機器人只用「回覆」，不花推播額度，免費方案即可。
+
+**設定（約 15 分鐘，只要一次）**
+1. 到 LINE Official Account Manager（manager.line.biz）建立一個官方帳號（免費方案即可）。
+2. 官方帳號的「設定 → Messaging API」→ 啟用 Messaging API。
+3. 「設定 → 帳號設定」把「加入群組或多人聊天室」改成接受；「回應設定」裡開啟 Webhook、關閉自動回應訊息和加入好友的歡迎訊息。
+4. 到 LINE Developers（developers.line.biz）→ 你的 channel →「Messaging API」分頁 → Channel access token（long-lived）按 Issue → 複製。
+5. Apps Script → 專案設定 → 指令碼屬性 → 新增 `LINE_CHANNEL_TOKEN`，貼上剛剛的 token。
+6. 換上新版 `Code.gs` → 部署 → 管理部署作業 → 編輯 → 新版本。
+7. 編輯器選函式 **`setupLine`** → 執行 → 執行紀錄會出現 Webhook URL（App 的設定頁「共同帳」也看得到）。
+8. LINE Developers →「Messaging API」→ Webhook URL 貼上 → Update → 打開「Use webhook」。
+   （按 Verify 可能顯示錯誤，這是 Apps Script 網址轉址造成的，直接用下一步實際測試即可。）
+9. 用手機掃官方帳號的 QR code 加好友 → 邀請它進你們的記帳群組。
+10. 在群組裡：**你**傳「綁定記帳」→ **張咘**傳「我是張咘」。完成！
+
+**張咘可以這樣傳**
+- `晚餐250`、`午餐 365`、`水果480 娃娃機70 安全帽罩子175`（一則多筆）
+- `代付 果乾200` 或 `果乾200(代付)` → 全額代付（你要還全部）
+- `基金 晚餐350` → 用共同基金付
+- `11/20 晚餐250` → 記在 11/20
+- 沒寫金額的品項（例如「下午茶」）不會記，機器人會請他補
+- `復原`：刪掉他上一則記的；`結算`：回覆目前誰欠誰（你也可以用）；`說明`：格式說明
+
+**安全性**：Webhook 網址帶一組只有你知道的密鑰，而且只處理綁定的群組、只記張咘的帳號。
+要重新綁定時，在 Apps Script 執行 `resetLineBinding()`。
 
 ## 匯入刷卡／電子支付截圖（Gemini 辨識）
 
@@ -113,6 +162,11 @@
    - 電子錢包「從銀行儲值」→ 記成轉帳（銀行 → 錢包）。
    - 自動判斷帳戶的順序：之前記住的末四碼 → 截圖上的銀行／錢包名稱 → 跟你已記的帳比對推測。
 3. 按「匯入勾選的 N 筆」。有末四碼的卡，會記住對應的帳戶，下次自動帶入（存在這台裝置）。
+
+**貼上文字**：同一個畫面切到「📋 貼上文字」，貼上從網銀、App、Excel 或帳單 Email 複製的交易紀錄 →「解析」。
+- 一行一筆（有日期和金額）的格式直接在手機上解析，不會送出去；支援「日期單獨一行、下面接交易」、+/− 號、NT$／$／TWD，「餘額 NT$xxx」會自動略過。
+- 排版亂掉的（例如一筆交易分成好幾行）會交給 Gemini 讀；沒網路或沒設定金鑰時，改用手機解析並提醒你核對。
+- 類別：先沿用你以前同樣內容記的類別，沒有的話用關鍵字猜（超商→餐食、捷運→交通、蝦皮→家用…）。
 
 注意：Gemini 免費額度送出的內容可能被 Google 用來改善產品；不想這樣可在 AI Studio 綁定付費帳戶。
 
@@ -141,12 +195,13 @@
 
 | 工作表 | 欄位 |
 |---|---|
-| Transactions | id, date, type(income/expense), amount, category, account, note, createdAt, updatedAt, link（轉帳兩筆共用） |
+| Transactions | id, date, type(income/expense), amount, category, account, note, createdAt, updatedAt, link（轉帳兩筆共用）, reimb（代墊）, myShare（自己負擔）, refId（收回連到哪筆代墊）, closed（代墊結案） |
 | Tasks | id, title, note, due, priority(1一般/2中/3高), done, doneAt, createdAt, updatedAt, repeat |
 | Events | id, title, date, start, end, allDay, location, note, createdAt, updatedAt, repeat, repeatUntil |
 | Routines | id, name, days(0=日…6=六，如 `12345`=平日), active, sort, createdAt, updatedAt |
 | RoutineLogs | id, routineId, date, createdAt（有一筆＝當天完成） |
 | Bills | id, name, kind(card/fixed), card, payAccount, closeDay, dueDay, dueOffset(0當月/1次月), amount, category, recordNote, overrides(各月實際金額 JSON), active, sort, createdAt, updatedAt |
+| Shared | id, date, kind(expense/settle/fund_in), payer(me/partner/fund), amount, split(half/full/custom), otherShare, note, category, createdBy(me/partner/line), txId, lineMsgId, createdAt, updatedAt |
 | Quick | id, name, type, amount, category, account, shared, sort, createdAt, updatedAt（釘選的常用按鈕） |
 | Notes | id, kind(note/diary), title, content, date, mood, tags, pinned, createdAt, updatedAt |
 

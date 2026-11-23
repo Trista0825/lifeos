@@ -1,8 +1,8 @@
 /* LifeOS 前端 — 原生 JavaScript，不需要編譯 */
 'use strict';
 
-const APP_VERSION = '2.6.0';
-const ENTITIES = ['Transactions', 'Tasks', 'Events', 'Routines', 'RoutineLogs', 'Notes', 'Bills', 'Quick'];
+const APP_VERSION = '3.0.0';
+const ENTITIES = ['Transactions', 'Tasks', 'Events', 'Routines', 'RoutineLogs', 'Notes', 'Bills', 'Quick', 'Shared'];
 
 // 選項來自原本的記帳小程序；清單只是建議，輸入框仍可打清單以外的新值
 const EXPENSE_CATS = ['餐食', '飲料', '交通', '家用', '服飾', '保養品', '課程', '娛樂', '醫療', '保險', '固定開銷',
@@ -27,6 +27,13 @@ const CARD_RE = /信用卡/;
 const OPENING_RE = /餘額\s*$/;
 
 const TRANSFER_CAT = '帳戶互轉';
+// 分帳相關類別
+const SETTLE_CAT = '共同結算';   // 和伴侶結清時記在你個人帳的類別
+const FUND_CAT = '共同基金';     // 你存進共同基金的錢（個人帳的支出）
+const REIMB_IN_CAT = '代墊收回'; // 同事還你代墊的錢
+// 這些收入其實是「別人還你的錢」，總覽會從支出扣掉、不算收入
+const REIMB_CATS = [REIMB_IN_CAT, SETTLE_CAT, '其他收入(代付)'];
+const MIGRATE_FROM = '2026-08-01'; // 舊的「(共同)」從這天開始轉進共同帳
 const QUICK_MAX = 12;        // 常用按鈕最多幾個（釘選的先排，再用歷史紀錄補）
 const QUICK_HISTORY = 1500;  // 統計常用按鈕時往回看幾筆
 
@@ -49,7 +56,7 @@ const REPEAT_OPTS = [['', '不重複'], ['daily', '每天'], ['weekly', '每週'
 const REPEAT_LABEL = Object.fromEntries(REPEAT_OPTS);
 const MOODS = [['', '—'], ['😄', '😄 很好'], ['🙂', '🙂 不錯'], ['😐', '😐 普通'], ['😔', '😔 低落'], ['😫', '😫 很累']];
 const DOW = ['日', '一', '二', '三', '四', '五', '六'];
-const TITLES = { import: '匯入明細', today: '今天', money: '記帳', tasks: '待辦', calendar: '行事曆', routines: '習慣', notes: '筆記', settings: '設定', reconcile: '月初對帳' };
+const TITLES = { shared: '共同帳', sharedMigrate: '轉入舊的共同支出', import: '匯入明細', today: '今天', money: '記帳', tasks: '待辦', calendar: '行事曆', routines: '習慣', notes: '筆記', settings: '設定', reconcile: '月初對帳' };
 
 /* ───────── 狀態 ───────── */
 const S = {
@@ -62,6 +69,9 @@ const S = {
   moneyMonth: ymd(new Date()).slice(0, 7),
   recMonth: ymd(new Date()).slice(0, 7),
   listAcct: '', // 明細篩選的帳戶（空白＝全部）
+  role: localStorage.getItem('lifeos.role') || 'owner', // owner＝你；partner＝伴侶（只能用共同帳）
+  names: loadJSON('lifeos.names', { ownerName: '我', partnerName: '伴侶' }),
+  shareCfg: null,
   calMonth: ymd(new Date()).slice(0, 7),
   calSel: ymd(new Date()),
   taskFilter: 'open',
@@ -248,11 +258,14 @@ async function syncAll(silent) {
   await flush();
   if (S.queue.length) { render(); return; } // 還有沒上傳的，先不要用伺服器資料覆蓋
   try {
-    const res = await api({ action: 'batch', requests: ENTITIES.map(e => ({ action: 'list', entity: e })) });
+    const ents = syncEntities();
+    const res = await api({ action: 'batch', requests: [{ action: 'whoami' }].concat(ents.map(e => ({ action: 'list', entity: e }))) });
     const errs = [];
-    res.results.forEach((r, i) => {
-      if (r.ok) S.data[ENTITIES[i]] = r.data;
-      else errs.push(ENTITIES[i] + '：' + r.error);
+    const who = res.results[0];
+    if (who && who.ok) setIdentity(who.data);
+    res.results.slice(1).forEach((r, i) => {
+      if (r.ok) S.data[ents[i]] = r.data;
+      else errs.push(ents[i] + '：' + r.error);
     });
     if (S.queue.length) return; // 同步途中又有新修改，等下一輪
     persist();
@@ -267,6 +280,17 @@ async function syncAll(silent) {
     if (!err.network || !silent) toast(err.message, !err.network);
   }
 }
+
+function syncEntities() { return S.role === 'partner' ? ['Shared'] : ENTITIES; }
+function setIdentity(d) {
+  const roleChanged = d.role && d.role !== S.role;
+  if (d.role) { S.role = d.role; localStorage.setItem('lifeos.role', d.role); }
+  S.names = { ownerName: d.ownerName || '我', partnerName: d.partnerName || '伴侶' };
+  saveJSON('lifeos.names', S.names);
+  applyRoleUi();
+  if (roleChanged && S.role === 'partner') S.view = 'shared';
+}
+function applyRoleUi() { document.body.classList.toggle('partner', S.role === 'partner'); }
 
 /* ───────── 資料操作（本機立即生效） ───────── */
 const find = (entity, id) => S.data[entity].find(r => r.id === id);
@@ -433,8 +457,9 @@ const VIEWS = {
     const month = t.slice(0, 7);
     const tx = S.data.Transactions.filter(counted);
     const todayExp = sum(tx.filter(x => x.date === t && x.type === 'expense'));
-    const monthExp = sum(tx.filter(x => x.date.slice(0, 7) === month && x.type === 'expense'));
-    const monthInc = sum(tx.filter(x => x.date.slice(0, 7) === month && x.type === 'income'));
+    const mReimb = sum(tx.filter(x => x.date.slice(0, 7) === month && x.type === 'income' && REIMB_CATS.includes(x.category)));
+    const monthExp = sum(tx.filter(x => x.date.slice(0, 7) === month && x.type === 'expense')) - mReimb;
+    const monthInc = sum(tx.filter(x => x.date.slice(0, 7) === month && x.type === 'income')) - mReimb;
     const tasks = sortTasks(S.data.Tasks.filter(x => !x.done && (!x.due || x.due <= t)));
     const routines = activeRoutines().filter(r => scheduledOn(r, t));
     const doneCount = routines.filter(r => isDoneOn(r.id, t)).length;
@@ -454,6 +479,7 @@ const VIEWS = {
         ${list(routines.map(r => routineItem(r, t)), '今天沒有排定的例行公事')}</div>
       <div class="card"><h3>待辦（今天與逾期）<a data-act="go" data-view="tasks">全部 ›</a></h3>
         ${list(tasks.slice(0, 8).map(taskItem), '都完成了 🎉')}</div>
+      ${todayShared()}
       ${todayReconcile()}
       ${todayBills()}
       <div class="card"><h3>本月收支 <a data-act="goMoney">總覽 ›</a></h3>
@@ -469,10 +495,10 @@ const VIEWS = {
     const seg = (v, label) => `<button class="${mode === v ? 'on' : ''}" data-act="moneyMode" data-v="${v}">${label}</button>`;
     return `
       <div class="toolbar">
-        <div class="seg">${seg('dash', '總覽')}${seg('report', '報表')}${seg('bills', '扣款')}${seg('list', '明細')}</div>
+        <div class="seg">${seg('dash', '總覽')}${seg('report', '報表')}${seg('bills', '扣款')}${seg('shared', '分帳')}${seg('list', '明細')}</div>
         ${monthNav('moneyMonth', S.moneyMonth)}
       </div>
-      ${mode === 'dash' ? moneyDashboard() : mode === 'report' ? moneyReports() : mode === 'bills' ? moneyBills() : moneyList()}`;
+      ${mode === 'dash' ? moneyDashboard() : mode === 'report' ? moneyReports() : mode === 'bills' ? moneyBills() : mode === 'shared' ? sharedPanel() : moneyList()}`;
   },
 
   tasks() {
@@ -576,11 +602,12 @@ const VIEWS = {
         <div class="field"><label>API Token</label><input id="cfgToken" value="${esc(S.cfg.token)}" placeholder="執行 setup() 後在執行紀錄中取得"></div>
         <div class="form-actions"><button class="btn" data-act="saveCfg">儲存並測試連線</button></div>
       </div>
-      <div class="card"><h3>常用按鈕</h3>
+      ${shareSettingsCard()}
+      ${S.role === 'partner' ? '' : `<div class="card"><h3>常用按鈕</h3>
         <p class="help">記帳時最上面的快捷按鈕。釘選的會排在最前面，其餘依你最常記的項目自動補上（最多 ${QUICK_MAX} 個）。記帳時勾選「加入常用按鈕」就能釘選。</p>
         ${list(S.data.Quick.map(q => `<li class="item"><div class="main" data-act="editQuick" data-id="${q.id}"><div class="title">📌 ${esc(q.name)}${q.shared ? ' <span class="tag">共同</span>' : ''}</div>
           <div class="sub">${q.type === 'income' ? '收入' : '支出'} · ${esc([q.category, q.account].filter(Boolean).join(' · '))}${Number(q.amount) ? ' · ' + money(q.amount) : ''}</div></div></li>`), '還沒有釘選的常用按鈕')}
-      </div>
+      </div>`}
       <div class="card"><h3>資料</h3>
         <p class="help">資料都存在你自己的 Google 試算表裡，這台裝置保留一份快取。<br>
         離線時可以照常查看與新增，連上網路後會自動上傳。<br>
@@ -637,8 +664,11 @@ function moneyDashboard() {
   const m = S.moneyMonth;
   const all = monthTx(m);
   const tx = all.filter(counted);
-  const incTx = tx.filter(x => x.type === 'income'), expTx = tx.filter(x => x.type === 'expense');
-  const inc = sum(incTx), exp = sum(expTx);
+  const allIn = tx.filter(x => x.type === 'income'), expTx = tx.filter(x => x.type === 'expense');
+  // 別人還你的錢（代墊收回、共同結算…）從支出扣掉，不算收入
+  const reimbIn = sum(allIn.filter(x => REIMB_CATS.includes(x.category)));
+  const incTx = allIn.filter(x => !REIMB_CATS.includes(x.category));
+  const inc = sum(incTx), exp = sum(expTx) - reimbIn;
   const prevExp = sum(monthTx(addMonths(m, -1)).filter(x => counted(x) && x.type === 'expense'));
   const sharedExp = sum(expTx.filter(isShared));
   const excludedN = all.length - tx.length;
@@ -677,6 +707,7 @@ function moneyDashboard() {
       <div><span>比上個月支出</span><b class="${diff > 0 ? 'expense' : 'income'}">${diff === null ? '—' : (diff > 0 ? '+' : '') + diff + '%'}</b></div>
       <div><span>${isCur ? '目前' : ''}日平均支出</span><b>${money(avg)}</b></div>
       <div><span>其中共同支出</span><b class="expense">${money(sharedExp)}</b></div>
+      ${reimbIn ? `<div><span>支出已扣掉別人還你的</span><b class="income">${money(reimbIn)}</b></div>` : ''}
     </div>
     <div class="card"><h3>每日支出 <span>最高 ${money(dMax === 1 ? 0 : dMax)}</span></h3>
       <div class="chart">${daily.map((v, i) => `<div class="col" title="${mo}/${i + 1} ${money(v)}"><i style="height:${v ? Math.max(3, v / dMax * 100) : 0}%"></i></div>`).join('')}</div>
@@ -1173,13 +1204,14 @@ function notesList() {
 }
 
 function render() {
+  if (S.role === 'partner' && !['shared', 'settings'].includes(S.view)) S.view = 'shared';
   const v = S.view;
   const search = document.activeElement && document.activeElement.id === 'noteSearch';
   $('#pageTitle').textContent = TITLES[v];
   $('#view').innerHTML = VIEWS[v]();
   document.querySelectorAll('.tabbar button').forEach(b => b.classList.toggle('active', b.dataset.view === v));
-  $('#fab').classList.toggle('hidden', v === 'settings' || v === 'reconcile' || v === 'import');
-  if (v === 'reconcile' || v === 'import') document.querySelector('.tabbar [data-view="money"]').classList.add('active');
+  $('#fab').classList.toggle('hidden', ['settings', 'reconcile', 'import', 'sharedMigrate'].includes(v));
+  if (v === 'reconcile' || v === 'import' || v === 'sharedMigrate') document.querySelector('.tabbar [data-view="money"]').classList.add('active');
   if (search) { const el = $('#noteSearch'); el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
   updateStatus();
 }
@@ -1333,7 +1365,7 @@ function txForm(rec) {
   const defDate = S.view === 'money' && S.moneyMonth !== today().slice(0, 7) ? S.moneyMonth + '-01' : today();
   let values;
   if (isTr) values = { type: 'transfer', amount: pair.out.amount, from: pair.out.account, to: pair.in.account, date: pair.out.date, note: stripShared(pair.out.note) === TRANSFER_CAT ? '' : stripShared(pair.out.note), _allowTransfer: true };
-  else if (rec) values = Object.assign({}, rec, { shared: isShared(rec), note: stripShared(rec.note), _allowTransfer: false });
+  else if (rec) values = Object.assign({}, rec, { shared: isShared(rec), note: stripShared(rec.note), _allowTransfer: false, people: '' });
   else values = { type: 'expense', shared: false, date: defDate, account: lastAccount('expense'), _allowTransfer: true };
   const chipList = rec ? [] : quickChips();
   const whenTransfer = v => v.type === 'transfer';
@@ -1360,7 +1392,14 @@ function txForm(rec) {
         ]
       },
       { name: 'note', label: v => v.type === 'transfer' ? '備註（可留空）' : '內容／備註' },
-      { name: 'shared', label: '共同（儲存時在內容後加上「(共同)」）', type: 'checkbox', hidden: whenTransfer },
+      { name: 'shared', label: () => `和${S.names.partnerName}共同（${S.names.partnerName}要分攤一半，自動記到共同帳）`, type: 'checkbox', hidden: whenTransfer },
+      { name: 'reimb', label: '幫別人代墊（例如同事，之後會還我）', type: 'checkbox', hidden: v => v.type !== 'expense' },
+      {
+        type: 'row', hidden: v => v.type !== 'expense' || !v.reimb, fields: [
+          { name: 'people', label: '幾個人分（含自己，可留空）', type: 'number', placeholder: '不確定就空著' },
+          { name: 'myShare', label: '我自己的部分', type: 'number', placeholder: '可留空' },
+        ]
+      },
       { name: 'pin', label: '加入常用按鈕', type: 'checkbox', hidden: v => !!rec || v.type === 'transfer' },
     ],
     hint: isTr ? '轉帳會同時修改轉出、轉入兩筆。' : '',
@@ -1371,14 +1410,21 @@ function txForm(rec) {
       const base = stripShared(v.note);
       const note = v.shared ? (base ? base + SHARED_SUFFIX : SHARED_SUFFIX) : base;
       const data = { type: v.type, amount: Number(v.amount), category: (v.category || '').trim() || '其他', date: v.date, account: (v.account || '').trim(), note };
-      rec ? updateRec('Transactions', rec.id, data) : createRec('Transactions', data);
+      if (v.type === 'expense') {
+        let my = v.myShare === '' || v.myShare == null ? '' : Number(v.myShare);
+        if (v.reimb && my === '' && Number(v.people) > 0) my = Math.round(data.amount / Number(v.people));
+        if (my !== '' && (my < 0 || my > data.amount)) throw new Error('「我自己的部分」要在 0 到總額之間');
+        Object.assign(data, { reimb: !!v.reimb, myShare: v.reimb ? my : '' });
+      }
+      const saved = rec ? (updateRec('Transactions', rec.id, data), find('Transactions', rec.id)) : createRec('Transactions', data);
+      syncSharedFromTx(saved, !!v.shared && v.type === 'expense');
       if (v.pin && base && !S.data.Quick.some(q => q.type === v.type && q.name === base && (q.shared === true) === !!v.shared)) {
         createRec('Quick', { name: base, type: v.type, amount: data.amount, category: data.category, account: data.account, shared: !!v.shared, sort: S.data.Quick.length });
       }
     },
     onDelete: rec && (() => {
       if (isTr) { removeRec('Transactions', pair.out.id); removeRec('Transactions', pair.in.id); }
-      else removeRec('Transactions', rec.id);
+      else { syncSharedFromTx(rec, false); removeRec('Transactions', rec.id); }
     }),
   });
 }
@@ -1654,8 +1700,11 @@ const ACTIONS = {
     saveJSON('lifeos.cfg', S.cfg);
     try {
       const r = await api({ action: 'ping' });
-      toast('連線成功（後端 v' + r.version + '）');
+      if (r.role) setIdentity({ role: r.role, ownerName: S.names.ownerName, partnerName: S.names.partnerName });
+      S.shareCfg = null; // 連線資訊變了，共同帳設定重新讀取
+      toast(r.role === 'partner' ? '連線成功（共同帳）' : '連線成功（後端 v' + r.version + '）');
       await syncAll(true);
+      if (S.role === 'partner') go('shared');
     } catch (err) {
       toast('連線失敗：' + err.message, true);
     }
@@ -1709,6 +1758,384 @@ const ACTIONS = {
     toast('已刪除');
   },
 };
+
+/* ───────── 共同帳（和伴侶分帳、共同基金）＋ 代墊應收 ───────── */
+const SPLIT_LABEL = { half: '對半', full: '全額代付', custom: '自訂' };
+function myKey() { return S.role === 'partner' ? 'partner' : 'me'; }
+function otherKey() { return S.role === 'partner' ? 'me' : 'partner'; }
+// 以「目前使用者」的角度稱呼：自己叫「你」
+function who(key) {
+  if (key === 'fund') return '共同基金';
+  if (key === myKey()) return '你';
+  return key === 'me' ? S.names.ownerName : S.names.partnerName;
+}
+function otherName() { return who(otherKey()); }
+// 伴侶欠你多少（正數＝伴侶要給你），跟後端算法一致
+function sharedCalc(rows) {
+  let owed = 0, fund = 0;
+  const fundIn = { me: 0, partner: 0 };
+  let fundOut = 0;
+  rows.forEach(r => {
+    const a = Number(r.amount) || 0;
+    if (r.kind === 'expense') {
+      if (r.payer === 'me') owed += Number(r.otherShare) || 0;
+      else if (r.payer === 'partner') owed -= Number(r.otherShare) || 0;
+      else { fund -= a; fundOut += a; }
+    } else if (r.kind === 'settle') owed += r.payer === 'partner' ? -a : a;
+    else if (r.kind === 'fund_in') { fund += a; fundIn[r.payer] = (fundIn[r.payer] || 0) + a; }
+  });
+  return { owed: Math.round(owed * 100) / 100, fund, fundIn, fundOut };
+}
+// 以目前使用者角度：正數＝對方要給你
+function owedToMe(owed) { return S.role === 'partner' ? -owed : owed; }
+function impactText(r) {
+  if (r.kind !== 'expense' || r.payer === 'fund') return '';
+  const o = Number(r.otherShare) || 0;
+  return r.payer === myKey() ? `${otherName()}欠你 ${money(o)}` : `你欠${who(r.payer)} ${money(o)}`;
+}
+function sharedRowTitle(r) {
+  if (r.kind === 'settle') return `💸 ${who(r.payer)}還給${who(r.payer === 'me' ? 'partner' : 'me')}`;
+  if (r.kind === 'fund_in') return `🏦 ${who(r.payer)}存入共同基金`;
+  return r.note || '共同支出';
+}
+function sharedRow(r) {
+  const sub = r.kind === 'expense'
+    ? [who(r.payer) + '付', r.payer === 'fund' ? '' : SPLIT_LABEL[r.split] || '', r.createdBy === 'line' ? 'LINE' : '', r.note && r.kind !== 'expense' ? r.note : ''].filter(Boolean).join('・')
+    : (r.note || '');
+  const imp = impactText(r);
+  const cls = r.kind === 'expense' && r.payer !== 'fund' ? (r.payer === myKey() ? 'income' : 'expense') : 'muted';
+  return `<li class="item"><div class="main" data-act="editShared" data-id="${r.id}">
+      <div class="title">${esc(sharedRowTitle(r))}</div><div class="sub">${esc(sub)}</div></div>
+    <div class="amount-col"><div class="amount">${money(r.amount)}</div>${imp ? `<div class="impact ${cls}">${esc(imp)}</div>` : ''}</div></li>`;
+}
+
+function sharedPanel() {
+  const rows = S.data.Shared || [];
+  const c = sharedCalc(rows);
+  const mine = owedToMe(c.owed);
+  const m = S.moneyMonth;
+  const mrows = rows.filter(r => String(r.date).slice(0, 7) === m).sort((a, b) => b.date.localeCompare(a.date) || String(b.createdAt).localeCompare(String(a.createdAt)));
+  const mc = sharedCalc(mrows);
+  const mExp = sharedCalc(mrows.filter(r => r.kind === 'expense')); // 這個月只看支出，還款只影響累計
+  const paid = k => sum(mrows.filter(r => r.kind === 'expense' && r.payer === k));
+  const big = Math.abs(mine) < 1 ? '已結清 👍' : mine > 0 ? `${otherName()}要給你 ${money(mine)}` : `你要給${otherName()} ${money(-mine)}`;
+  // 基金：要各出一半，看誰存得比較少
+  const diffFund = (c.fundIn.me || 0) - (c.fundIn.partner || 0);
+  const fundFair = Math.abs(diffFund) < 1 ? '兩人存的一樣多' : `${who(diffFund > 0 ? 'me' : 'partner')}多存了 ${money(Math.abs(diffFund))}`;
+  const groups = {};
+  mrows.forEach(r => (groups[r.date] = groups[r.date] || []).push(r));
+  const owner = S.role !== 'partner';
+  return `
+    ${owner ? migrateBanner() : ''}
+    <div class="card share-hero ${mine >= 1 ? 'pos' : mine <= -1 ? 'neg' : ''}">
+      <div class="label">累計（還沒結清的）</div><div class="big">${big}</div>
+      <div class="form-actions" style="grid-template-columns:1fr 1fr"><button class="btn" data-act="newSettle">記錄還款</button><button class="btn secondary" data-act="newSharedExp">＋ 共同支出</button></div>
+    </div>
+    <div class="card"><h3>共同基金 <span>餘額 <b class="${c.fund < 0 ? 'expense' : ''}">${money(c.fund)}</b></span></h3>
+      <div class="kv">
+        <div><span>${Number(m.slice(5))} 月存入</span><b>${who('me')} ${money(mc.fundIn.me || 0)}・${who('partner')} ${money(mc.fundIn.partner || 0)}</b></div>
+        <div><span>${Number(m.slice(5))} 月用基金付</span><b class="expense">${money(mc.fundOut)}</b></div>
+        <div><span>累計存入</span><b>${fundFair}</b></div>
+      </div>
+      <div class="form-actions" style="grid-template-columns:1fr 1fr"><button class="btn secondary" data-act="newFundIn">存入基金</button><button class="btn secondary" data-act="newFundExp">用基金付</button></div>
+    </div>
+    <div class="card"><h3>${Number(m.slice(5))} 月共同支出</h3>
+      <div class="kv">
+        <div><span>你付的</span><b>${money(paid(myKey()))}</b></div>
+        <div><span>${otherName()}付的</span><b>${money(paid(otherKey()))}</b></div>
+        <div><span>這個月的支出${owedToMe(mExp.owed) >= 0 ? otherName() + '要分給你' : '你要分給' + otherName()}</span><b>${money(Math.abs(owedToMe(mExp.owed)))}</b></div>
+      </div></div>
+    ${Object.keys(groups).length ? Object.entries(groups).map(([d, arr]) => `<div class="group-head"><span>${dateLabel(d)}</span></div>
+      <div class="card tight">${list(arr.map(sharedRow), '')}</div>`).join('') : '<div class="card"><div class="empty">這個月還沒有共同支出</div></div>'}
+    ${owner ? receivablesCard() : ''}`;
+}
+VIEWS.shared = function () {
+  return `<div class="toolbar">${monthNav('moneyMonth', S.moneyMonth)}</div>${sharedPanel()}`;
+};
+
+function todayShared() {
+  if (!(S.data.Shared || []).length) return '';
+  const mine = owedToMe(sharedCalc(S.data.Shared).owed);
+  const txt = Math.abs(mine) < 1 ? '已結清 👍' : mine > 0 ? `${otherName()}要給你 ${money(mine)}` : `你要給${otherName()} ${money(-mine)}`;
+  return `<div class="card"><h3>共同帳 <a data-act="goShared">分帳 ›</a></h3><div class="share-mini">${txt}</div></div>`;
+}
+
+// 你個人帳的一筆支出勾了「共同」→ 共同帳自動有一筆（你付、預設對半），改／刪同步
+function syncSharedFromTx(tx, shared) {
+  if (!tx || S.role === 'partner') return;
+  const linked = (S.data.Shared || []).find(r => r.txId === tx.id);
+  if (!shared) { if (linked) removeRec('Shared', linked.id); return; }
+  const data = { date: tx.date, kind: 'expense', amount: Number(tx.amount), note: stripShared(tx.note) || tx.category, category: tx.category };
+  if (linked) {
+    if (linked.payer === 'fund') { updateRec('Shared', linked.id, data); return; }
+    const split = linked.split || 'half';
+    const other = split === 'half' ? Math.round(data.amount / 2 * 100) / 100 : split === 'full' ? data.amount : Math.min(Number(linked.otherShare) || 0, data.amount);
+    updateRec('Shared', linked.id, Object.assign(data, { split, otherShare: other }));
+  } else {
+    createRec('Shared', Object.assign(data, { payer: 'me', split: 'half', otherShare: Math.round(data.amount / 2 * 100) / 100, txId: tx.id, createdBy: 'me' }));
+  }
+}
+
+function payerOptions(kind) {
+  const o = [[myKey(), '你'], [otherKey(), otherName()]];
+  if (kind === 'expense') o.push(['fund', '共同基金']);
+  return o;
+}
+function sharedForm(rec, preset) {
+  if (rec && S.role === 'partner' && rec.createdBy === 'me') { toast(`這筆是${S.names.ownerName}記的，只有她能修改`, true); return; }
+  // 從個人帳勾「共同」來的支出，改個人帳那筆就好（兩邊會同步）
+  if (rec && rec.kind === 'expense' && rec.txId && S.role !== 'partner') { const tx = find('Transactions', rec.txId); if (tx) { txForm(tx); return; } }
+  const kind = rec ? rec.kind : preset.kind;
+  const v0 = rec ? Object.assign({}, rec) : Object.assign({ date: today(), payer: myKey(), split: 'half', amount: '' }, preset);
+  const titles = { expense: '共同支出', settle: '還款', fund_in: '存入共同基金' };
+  const fields = [];
+  if (kind === 'settle') {
+    fields.push({ name: 'payer', label: '誰還給誰', type: 'select', options: [[otherKey(), `${otherName()} → 你`], [myKey(), `你 → ${otherName()}`]] });
+  } else {
+    fields.push({ name: 'payer', label: kind === 'fund_in' ? '誰存的' : '誰付的', type: 'select', options: kind === 'fund_in' ? payerOptions('fund_in') : payerOptions('expense') });
+  }
+  fields.push({ type: 'row', fields: [{ name: 'amount', label: '金額', type: 'number' }, { name: 'date', label: '日期', type: 'date' }] });
+  if (kind === 'expense') {
+    fields.push({ name: 'note', label: '內容', placeholder: '例如：晚餐' });
+    fields.push({
+      name: 'split', label: '怎麼分', type: 'select', hidden: v => v.payer === 'fund',
+      options: [['half', '對半'], ['full', '全額代付（對方要還全部）'], ['custom', '自訂對方要負擔的金額']]
+    });
+    fields.push({ name: 'otherShare', label: '對方要負擔多少', type: 'number', hidden: v => v.payer === 'fund' || v.split !== 'custom' });
+  } else {
+    fields.push({ name: 'note', label: '備註（可留空）' });
+  }
+  const owner = S.role !== 'partner';
+  // 你自己的錢進出時，順便記到你的個人帳
+  const personal = owner && ((kind === 'fund_in') || kind === 'settle');
+  if (personal && !rec) {
+    fields.push({
+      name: 'account', label: kind === 'fund_in' ? '從哪個帳戶拿出來（你存的才會記到個人帳；空白＝不記）' : '收到／付出的帳戶（空白＝不記到個人帳）',
+      suggest: () => uniq(['現金'].concat(BANKS, S.data.Transactions.map(t => t.account)).filter(a => a && !isCard(a)))
+    });
+  }
+  if (!rec && kind === 'settle') {
+    const mine = owedToMe(sharedCalc(S.data.Shared || []).owed);
+    v0.amount = Math.abs(mine) >= 1 ? Math.abs(mine) : '';
+    v0.payer = mine > 0 ? otherKey() : myKey();
+  }
+  if (!rec && kind === 'fund_in') { v0.amount = 5000; if (personal) v0.account = '現金'; }
+  if (!rec && kind === 'settle' && personal) v0.account = '';
+  openForm({
+    title: (rec ? '編輯' : '新增') + titles[kind],
+    values: v0,
+    fields,
+    hint: kind === 'expense' && !rec ? '你在個人記帳勾「共同」的會自動出現在這裡，不用再記一次。' : '',
+    onSave: v => {
+      const amt = Number(v.amount);
+      if (!(amt > 0)) throw new Error('請輸入金額');
+      if (!v.date) throw new Error('請選擇日期');
+      const data = { kind, payer: v.payer, amount: amt, date: v.date, note: String(v.note || '').trim() };
+      if (kind === 'expense') {
+        data.split = v.payer === 'fund' ? '' : v.split;
+        data.otherShare = v.split === 'custom' ? Number(v.otherShare) : v.split === 'full' ? amt : Math.round(amt / 2 * 100) / 100;
+        if (v.split === 'custom' && !(data.otherShare >= 0 && data.otherShare <= amt)) throw new Error('對方負擔的金額要在 0 到總額之間');
+        if (v.payer === 'fund') data.otherShare = 0;
+      }
+      if (rec) { updateRec('Shared', rec.id, data); return; }
+      const acct = String(v.account || '').trim();
+      let txId = '';
+      if (personal && acct && (kind === 'settle' || v.payer === 'me')) {
+        const incoming = kind === 'settle' && v.payer === 'partner';
+        const tx = createRec('Transactions', {
+          type: incoming ? 'income' : 'expense', amount: amt, date: v.date, account: acct,
+          category: kind === 'settle' ? SETTLE_CAT : FUND_CAT,
+          note: kind === 'settle' ? (incoming ? S.names.partnerName + '還款' : '還' + S.names.partnerName) : '存入共同基金'
+        });
+        txId = tx.id;
+      }
+      createRec('Shared', Object.assign(data, { txId, createdBy: myKey() === 'me' ? 'me' : 'partner' }));
+    },
+    onDelete: rec && (() => {
+      if (rec.txId && owner) { const tx = find('Transactions', rec.txId); if (tx && (tx.category === SETTLE_CAT || tx.category === FUND_CAT)) removeRec('Transactions', tx.id); }
+      removeRec('Shared', rec.id);
+    }),
+  });
+}
+
+/* 舊的「(共同)」轉進共同帳 */
+function unmigratedShared() {
+  const linked = new Set((S.data.Shared || []).map(r => r.txId).filter(Boolean));
+  return S.data.Transactions.filter(t => t.type === 'expense' && isShared(t) && t.date >= MIGRATE_FROM && !linked.has(t.id))
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+function migrateBanner() {
+  const n = unmigratedShared().length;
+  if (!n) return '';
+  return `<div class="alert warn" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+    <span>你從 ${Number(MIGRATE_FROM.slice(5, 7))} 月起有 <b>${n}</b> 筆「(共同)」還沒轉進共同帳</span>
+    <button class="chip" data-act="openMigrate">檢查並轉入</button></div>`;
+}
+const MIG = { pick: {} };
+VIEWS.sharedMigrate = function () {
+  const rows = unmigratedShared();
+  rows.forEach(t => { if (!MIG.pick[t.id]) MIG.pick[t.id] = { sel: true, payer: 'me' }; });
+  const n = rows.filter(t => MIG.pick[t.id].sel).length;
+  const owe = rows.filter(t => MIG.pick[t.id].sel && MIG.pick[t.id].payer === 'me').reduce((s2, t) => s2 + Number(t.amount) / 2, 0);
+  return `<div class="toolbar"><button class="chip" data-act="migBack">‹ 返回分帳</button></div>
+    <div class="card"><p class="help" style="margin:0">這些是你 ${Number(MIGRATE_FROM.slice(5, 7))} 月起記的「(共同)」。預設算成「你付、${S.names.partnerName}分攤一半」。
+      如果某筆其實是用<b>共同基金</b>付的（例如現金結算），改成「基金付」；不是共同的就取消勾選。</p></div>
+    <div class="card tight">${rows.map(t => `<div class="mig-row ${MIG.pick[t.id].sel ? '' : 'off'}">
+      <input type="checkbox" class="mig-f" data-id="${t.id}" data-f="sel" ${MIG.pick[t.id].sel ? 'checked' : ''}>
+      <div class="main"><div class="title">${esc(stripShared(t.note) || t.category)}</div><div class="sub">${md(t.date)} · ${esc(t.account)}</div></div>
+      <select class="mig-f" data-id="${t.id}" data-f="payer"><option value="me" ${MIG.pick[t.id].payer === 'me' ? 'selected' : ''}>你付・對半</option><option value="fund" ${MIG.pick[t.id].payer === 'fund' ? 'selected' : ''}>基金付</option></select>
+      <div class="amount">${money(t.amount)}</div></div>`).join('')}</div>
+    <div class="imp-bar"><button class="btn" data-act="migCommit">轉入 ${n} 筆（${S.names.partnerName}要分攤 ${money(owe)}）</button></div>`;
+};
+function commitMigrate() {
+  let n = 0;
+  unmigratedShared().forEach(t => {
+    const p = MIG.pick[t.id];
+    if (!p || !p.sel) return;
+    const amt = Number(t.amount);
+    createRec('Shared', {
+      date: t.date, kind: 'expense', payer: p.payer, amount: amt, split: p.payer === 'fund' ? '' : 'half',
+      otherShare: p.payer === 'fund' ? 0 : Math.round(amt / 2 * 100) / 100, note: stripShared(t.note) || t.category, category: t.category, txId: t.id, createdBy: 'me'
+    });
+    n++;
+  });
+  MIG.pick = {};
+  S.moneyMode = 'shared';
+  go('money');
+  toast(`已轉入 ${n} 筆`);
+}
+
+/* 代墊應收：你先付、別人之後還你 */
+function reimbInfo(t) {
+  const got = sum(S.data.Transactions.filter(x => x.type === 'income' && x.refId === t.id));
+  const my = t.myShare === '' || t.myShare == null ? null : Number(t.myShare);
+  const pending = Number(t.amount) - (my || 0) - got;
+  return { got, my, pending };
+}
+function receivablesCard() {
+  const open = S.data.Transactions.filter(t => t.type === 'expense' && t.reimb === true && t.closed !== true)
+    .sort((a, b) => a.date.localeCompare(b.date));
+  if (!open.length) return `<div class="card"><h3>代墊應收</h3><div class="empty">沒有待收回的代墊。記帳時勾「幫別人代墊」就會出現在這裡。</div></div>`;
+  const total = open.reduce((s2, t) => s2 + Math.max(0, reimbInfo(t).pending), 0);
+  return `<div class="card"><h3>代墊應收 <span>待收 <b class="expense">${money(total)}</b></span></h3>${open.map(t => {
+    const i = reimbInfo(t);
+    return `<div class="recv">
+      <div class="main" data-act="editTx" data-id="${t.id}"><div class="title">${esc(stripShared(t.note) || t.category)}</div>
+        <div class="sub">${md(t.date)} · ${esc(t.account)} · 總額 ${money(t.amount)}${i.my !== null ? ' · 我的部分 ' + money(i.my) : ''} · 已收 ${money(i.got)}</div></div>
+      <div class="recv-r"><div class="amount ${i.pending > 0 ? 'expense' : 'income'}">${i.my === null ? '待收' : i.pending > 0 ? '待收' : '已收齊'} ${money(Math.max(0, i.pending))}</div>
+        <div class="recv-btns"><button class="chip" data-act="recvMoney" data-id="${t.id}">收到錢</button><button class="chip" data-act="recvClose" data-id="${t.id}">結案</button></div></div>
+    </div>`;
+  }).join('')}<p class="help">人數不確定時「我自己的部分」可以先空著，收完錢再按「結案」。</p></div>`;
+}
+function recvForm(t) {
+  const i = reimbInfo(t);
+  openForm({
+    title: '收到代墊的錢',
+    values: { amount: i.my !== null && i.pending > 0 ? '' : '', date: today(), account: '現金', from: '' },
+    fields: [
+      { type: 'row', fields: [{ name: 'amount', label: '收到多少', type: 'number' }, { name: 'date', label: '日期', type: 'date' }] },
+      { name: 'from', label: '誰給的（可留空）', placeholder: '例如：同事 A' },
+      { name: 'account', label: '收到哪裡', suggest: () => uniq(['現金', 'line pay'].concat(BANKS).filter(a => !isCard(a))) },
+    ],
+    hint: `「${esc(stripShared(t.note) || t.category)}」總額 ${money(t.amount)}，已收 ${money(i.got)}${i.my !== null ? `，還有 ${money(Math.max(0, i.pending))} 沒收` : ''}`,
+    onSave: v => {
+      const amt = Number(v.amount);
+      if (!(amt > 0)) throw new Error('請輸入金額');
+      createRec('Transactions', {
+        type: 'income', amount: amt, date: v.date || today(), account: String(v.account || '現金').trim(),
+        category: REIMB_IN_CAT, note: `${String(v.from || '').trim() ? String(v.from).trim() + ' 還' : '收回'}：${stripShared(t.note) || t.category}`, refId: t.id
+      });
+      const after = reimbInfo(t);
+      if (after.my !== null && after.pending <= 0.5) updateRec('Transactions', t.id, { closed: true });
+    },
+  });
+}
+
+/* 設定頁：共同帳 */
+async function loadShareConfig(data) {
+  try { const r = await api({ action: 'shareConfig', data }); S.shareCfg = r.data; S.names = { ownerName: r.data.ownerName, partnerName: r.data.partnerName }; saveJSON('lifeos.names', S.names); }
+  catch (err) { S.shareCfg = { error: err.message }; }
+  if (S.view === 'settings') render();
+}
+function partnerLink(cfg) {
+  if (!cfg || !cfg.partnerToken) return '';
+  const payload = btoa(unescape(encodeURIComponent(JSON.stringify({ url: S.cfg.url, token: cfg.partnerToken }))));
+  return location.origin + location.pathname + '#setup=' + payload;
+}
+function shareSettingsCard() {
+  if (S.role === 'partner') return `<div class="card"><h3>共同帳</h3><p class="help">你是用「${esc(S.names.partnerName)}」的身分連線，只會看到和${esc(S.names.ownerName)}的共同帳。</p></div>`;
+  if (!S.cfg.url || !S.cfg.token) return '';
+  const c = S.shareCfg;
+  if (!c) { loadShareConfig(); return '<div class="card"><h3>共同帳</h3><div class="empty">讀取中…</div></div>'; }
+  if (c.error) return `<div class="card"><h3>共同帳</h3><div class="alert warn">${esc(c.error)}<br>（如果剛更新程式，請確認後端已部署 v1.6 以上）</div>
+    <button class="btn secondary" data-act="shareRetry">重試</button></div>`;
+  const link = partnerLink(c);
+  const L = c.line || {};
+  return `<div class="card"><h3>共同帳</h3>
+    <div class="row2"><div class="field"><label>你的稱呼（給${esc(c.partnerName)}看的）</label><input id="cfgOwnerName" value="${esc(c.ownerName)}"></div>
+      <div class="field"><label>伴侶的稱呼</label><input id="cfgPartnerName" value="${esc(c.partnerName)}"></div></div>
+    <div class="form-actions"><button class="btn secondary" data-act="saveNames">儲存稱呼</button></div>
+    <div class="field" style="margin-top:12px"><label>給${esc(c.partnerName)}的連結（他打開就會自動設定，只看得到共同帳）</label>
+      ${link ? `<input id="partnerLink" value="${esc(link)}" readonly>` : '<div class="empty">還沒產生</div>'}</div>
+    <div class="form-actions" style="grid-template-columns:1fr 1fr">
+      ${link ? '<button class="btn" data-act="copyPartnerLink">複製連結</button>' : ''}
+      <button class="btn secondary" data-act="resetPartner">${link ? '重新產生（舊連結失效）' : '產生連結'}</button></div>
+    <h3 style="margin-top:16px">LINE 群組自動記帳</h3>
+    <div class="kv">
+      <div><span>機器人設定</span><b class="${L.configured ? 'income' : 'expense'}">${L.configured ? '✓ 完成' : '尚未設定'}</b></div>
+      <div><span>綁定群組</span><b class="${L.groupBound ? 'income' : 'muted'}">${L.groupBound ? '✓ 已綁定' : '在群組傳「綁定記帳」'}</b></div>
+      <div><span>認出${esc(c.partnerName)}</span><b class="${L.partnerBound ? 'income' : 'muted'}">${L.partnerBound ? '✓ 已綁定' : `請他傳「我是${esc(c.partnerName)}」`}</b></div>
+    </div>
+    ${L.webhookUrl ? `<div class="field" style="margin-top:10px"><label>Webhook URL（貼到 LINE Developers）</label><input id="webhookUrl" value="${esc(L.webhookUrl)}" readonly></div>` : '<p class="help">設定步驟見 README「LINE 群組自動記帳」。</p>'}
+  </div>`;
+}
+function copyText(id) {
+  const el = $('#' + id);
+  el.select();
+  (navigator.clipboard ? navigator.clipboard.writeText(el.value) : Promise.reject()).then(() => toast('已複製'), () => { document.execCommand('copy'); toast('已複製'); });
+}
+// 從伴侶連結開啟：#setup=…
+function consumeSetupLink() {
+  const m = location.hash.match(/^#setup=(.+)$/);
+  if (!m) return false;
+  try {
+    const d = JSON.parse(decodeURIComponent(escape(atob(m[1]))));
+    if (d.url && d.token) {
+      S.cfg = { url: d.url, token: d.token }; saveJSON('lifeos.cfg', S.cfg);
+      S.data = Object.fromEntries(ENTITIES.map(e => [e, []])); persist();
+    }
+  } catch (e) { /* 連結格式錯誤 */ }
+  history.replaceState(null, '', location.pathname + location.search);
+  return true;
+}
+
+Object.assign(ACTIONS, {
+  goShared: () => { if (S.role === 'partner') go('shared'); else { S.moneyMode = 'shared'; S.moneyMonth = today().slice(0, 7); go('money'); } },
+  newSettle: () => sharedForm(null, { kind: 'settle' }),
+  newSharedExp: () => sharedForm(null, { kind: 'expense' }),
+  newFundIn: () => sharedForm(null, { kind: 'fund_in' }),
+  newFundExp: () => sharedForm(null, { kind: 'expense', payer: 'fund' }),
+  editShared: el => sharedForm(find('Shared', el.dataset.id)),
+  openMigrate: () => go('sharedMigrate'),
+  migBack: () => { S.moneyMode = 'shared'; go('money'); },
+  migCommit: () => commitMigrate(),
+  recvMoney: el => recvForm(find('Transactions', el.dataset.id)),
+  recvClose: el => { if (confirm('結案後就不會再出現在待收清單（已收的錢不受影響）。確定？')) { updateRec('Transactions', el.dataset.id, { closed: true }); render(); } },
+  saveNames: () => loadShareConfig({ ownerName: $('#cfgOwnerName').value, partnerName: $('#cfgPartnerName').value }).then(() => toast('已儲存')),
+  resetPartner: async () => {
+    if (S.shareCfg && S.shareCfg.partnerToken && !confirm('重新產生後，舊連結會立刻失效，要給對方新連結。確定？')) return;
+    try { const r = await api({ action: 'resetPartnerToken' }); S.shareCfg = r.data; render(); } catch (err) { toast(err.message, true); }
+  },
+  copyPartnerLink: () => copyText('partnerLink'),
+  shareRetry: () => { S.shareCfg = null; render(); },
+});
+document.addEventListener('change', e => {
+  const el = e.target;
+  if (!el.classList.contains('mig-f')) return;
+  const p = MIG.pick[el.dataset.id];
+  p[el.dataset.f] = el.type === 'checkbox' ? el.checked : el.value;
+  render();
+});
 
 /* ───────── 匯入截圖（Gemini 辨識） ───────── */
 const WALLETS = ['line pay', 'IPass money', '支付寶'];
@@ -2189,10 +2616,12 @@ $('#modalForm').addEventListener('focusout', e => {
   if (!el.value) el.value = el.dataset.prev;
   delete el.dataset.prev;
 });
-$('#modalForm').addEventListener('change', e => { if (['allDay', 'repeat', 'kind'].includes(e.target.name)) rerenderForm(); });
+// 這些欄位會決定其他欄位要不要顯示，改了就重畫表單
+$('#modalForm').addEventListener('change', e => { if (['allDay', 'repeat', 'kind', 'reimb', 'payer', 'split'].includes(e.target.name)) rerenderForm(); });
 $('#fab').addEventListener('click', () => {
   ({
-    today: () => txForm(), money: () => S.moneyMode === 'bills' ? billForm() : txForm(), tasks: () => taskForm(),
+    today: () => txForm(), money: () => S.moneyMode === 'bills' ? billForm() : S.moneyMode === 'shared' ? sharedForm(null, { kind: 'expense' }) : txForm(), tasks: () => taskForm(),
+    shared: () => sharedForm(null, { kind: 'expense' }),
     calendar: () => eventForm(null, S.calSel), routines: () => routineForm(),
     notes: () => S.notesMode === 'diary' ? openDiary(today()) : noteForm(null, 'note'),
   })[S.view]();
@@ -2202,7 +2631,11 @@ $('#fab').addEventListener('click', () => {
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
   navigator.serviceWorker.register('sw.js').catch(() => { });
 }
-if (!S.cfg.url || !S.cfg.token) {
+applyRoleUi();
+if (consumeSetupLink()) {
+  api({ action: 'ping' }).then(r => { setIdentity({ role: r.role, ownerName: S.names.ownerName, partnerName: S.names.partnerName }); toast('已連線到共同帳'); return syncAll(true); })
+    .then(() => go(S.role === 'partner' ? 'shared' : 'today')).catch(err => { go('settings'); toast('連結無效：' + err.message, true); });
+} else if (!S.cfg.url || !S.cfg.token) {
   go('settings');
   toast('第一次使用，請先填入連線設定');
 } else {

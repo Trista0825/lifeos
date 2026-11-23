@@ -9,14 +9,16 @@
  *            → 部署 → 管理部署作業 → 編輯 → 新版本。
  */
 
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.6.0';
 
 // 資料表定義：欄位順序 = 工作表欄位順序。
 // 新增欄位一律加在最後面，舊資料才不會錯位。
 const SCHEMA = {
   Transactions: {
-    fields: ['id', 'date', 'type', 'amount', 'category', 'account', 'note', 'createdAt', 'updatedAt'],
-    types: { date: 'date', amount: 'number' },
+    // link：轉帳的兩筆（轉出、轉入）共用同一個 link
+    // reimb：幫別人代墊（之後會收回）；myShare：自己負擔的部分；refId：收回的錢連到哪一筆代墊；closed：代墊已結案
+    fields: ['id', 'date', 'type', 'amount', 'category', 'account', 'note', 'createdAt', 'updatedAt', 'link', 'reimb', 'myShare', 'refId', 'closed'],
+    types: { date: 'date', amount: 'number', reimb: 'bool', myShare: 'number', closed: 'bool' },
     required: ['date', 'type', 'amount'],
   },
   Tasks: {
@@ -46,6 +48,29 @@ const SCHEMA = {
     fields: ['id', 'kind', 'title', 'content', 'date', 'mood', 'tags', 'pinned', 'createdAt', 'updatedAt'],
     types: { date: 'date', pinned: 'bool' },
     required: ['kind'],
+  },
+  Shared: {
+    // 共同帳（你和伴侶都看得到）
+    // kind：expense 共同支出｜settle 還款｜fund_in 存入共同基金
+    // payer：me 你｜partner 伴侶｜fund 共同基金（只用在 expense）
+    // split：half 對半｜full 全額代付｜custom 自訂；otherShare：沒付錢的那一方要負擔的金額
+    // createdBy：me｜partner｜line；txId：連到你個人帳的那一筆；lineMsgId：LINE 訊息編號（避免重複）
+    fields: ['id', 'date', 'kind', 'payer', 'amount', 'split', 'otherShare', 'note', 'category', 'createdBy', 'txId', 'lineMsgId', 'createdAt', 'updatedAt'],
+    types: { date: 'date', amount: 'number', otherShare: 'number' },
+    required: ['date', 'kind', 'payer', 'amount'],
+  },
+  Quick: {
+    // 記帳表單的常用按鈕（釘選的項目）
+    fields: ['id', 'name', 'type', 'amount', 'category', 'account', 'shared', 'sort', 'createdAt', 'updatedAt'],
+    types: { amount: 'number', shared: 'bool', sort: 'number' },
+    required: ['name', 'type'],
+  },
+  Bills: {
+    // 固定扣款設定。kind：card（信用卡，金額依帳單）| fixed（固定金額，如貸款）
+    // dueOffset：0＝結帳當月扣款，1＝結帳次月扣款；overrides：各月實際帳單金額 JSON，如 {"2026-12":7338}
+    fields: ['id', 'name', 'kind', 'card', 'payAccount', 'closeDay', 'dueDay', 'dueOffset', 'amount', 'category', 'recordNote', 'overrides', 'active', 'sort', 'createdAt', 'updatedAt'],
+    types: { closeDay: 'number', dueDay: 'number', dueOffset: 'number', amount: 'number', active: 'bool', sort: 'number' },
+    required: ['name', 'kind', 'payAccount', 'dueDay'],
   },
 };
 
@@ -97,29 +122,59 @@ function doGet() {
 
 function doPost(e) {
   try {
+    const props = PropertiesService.getScriptProperties();
     const req = JSON.parse((e && e.postData && e.postData.contents) || '{}');
-    const token = PropertiesService.getScriptProperties().getProperty('API_TOKEN');
-    if (!token || req.token !== token) return json_({ ok: false, error: 'Token 錯誤或尚未執行 setup()' });
-    return json_(handle_(req));
+    // LINE 群組機器人：網址帶 ?line=密鑰 才處理
+    if (req.events && e.parameter && e.parameter.line) {
+      const key = props.getProperty('LINE_WEBHOOK_KEY');
+      if (key && e.parameter.line === key) handleLine_(req);
+      return json_({ ok: true });
+    }
+    const owner = props.getProperty('API_TOKEN');
+    const partner = props.getProperty('PARTNER_TOKEN');
+    let role = '';
+    if (owner && req.token === owner) role = 'owner';
+    else if (partner && req.token === partner) role = 'partner';
+    if (!role) return json_({ ok: false, error: 'Token 錯誤或尚未執行 setup()' });
+    return json_(handle_(req, role));
   } catch (err) {
     return json_({ ok: false, error: String(err && err.message ? err.message : err) });
   }
 }
 
-function handle_(req) {
+// 伴侶 Token 只能用共同帳
+const PARTNER_ACTIONS = ['ping', 'whoami', 'list', 'create', 'update', 'remove'];
+
+function handle_(req, role) {
+  role = role || 'owner';
   if (req.action === 'batch') {
     const results = (req.requests || []).map(function (r) {
-      try { return handle_(r); } catch (err) { return { ok: false, error: String(err.message || err) }; }
+      try { return handle_(r, role); } catch (err) { return { ok: false, error: String(err.message || err) }; }
     });
     return { ok: true, results: results };
   }
+  if (role === 'partner') {
+    if (PARTNER_ACTIONS.indexOf(req.action) < 0) throw new Error('沒有權限');
+    if (['list', 'create', 'update', 'remove'].indexOf(req.action) >= 0 && req.entity !== 'Shared') throw new Error('沒有權限');
+    if (req.action === 'update' || req.action === 'remove') {
+      const row = findShared_(req.id);
+      if (row && row.createdBy === 'me') throw new Error('這筆是對方記的，只有她能修改');
+    }
+  }
+  if (req.action === 'create' && req.entity === 'Shared') {
+    req.data = Object.assign({}, req.data, { createdBy: role === 'partner' ? 'partner' : 'me' });
+  }
   switch (req.action) {
-    case 'ping': return { ok: true, version: APP_VERSION };
+    case 'ping': return { ok: true, version: APP_VERSION, role: role };
+    case 'whoami': return { ok: true, data: whoami_(role) };
+    case 'shareConfig': return { ok: true, data: shareConfig_(req.data) };
+    case 'resetPartnerToken': return { ok: true, data: resetPartnerToken_() };
     case 'list': return { ok: true, data: list_(req.entity, req.from, req.to) };
     case 'create': return withLock_(function () { return { ok: true, data: create_(req.entity, req.data || {}) }; });
     case 'update': return withLock_(function () { return { ok: true, data: update_(req.entity, req.id, req.data || {}) }; });
     case 'remove': return withLock_(function () { remove_(req.entity, req.id); return { ok: true }; });
     case 'setRoutineLog': return withLock_(function () { return { ok: true, data: setRoutineLog_(req.routineId, req.date, req.done, req.id) }; });
+    case 'parseStatement': return { ok: true, data: parseStatement_(req) };
     case 'toggleRoutine': return withLock_(function () { return { ok: true, data: toggleRoutine_(req.routineId, req.date) }; });
     default: throw new Error('未知的 action：' + req.action);
   }
@@ -175,6 +230,7 @@ function create_(entity, data) {
   rec.createdAt = validIso_(data.createdAt) ? data.createdAt : now;
   if (def.fields.indexOf('updatedAt') >= 0) rec.updatedAt = now;
   if (entity === 'Tasks' && rec.done && !rec.doneAt) rec.doneAt = now;
+  if (entity === 'Shared') normalizeShared_(rec);
   const values = toRow_(entity, rec);
   const row = sh.getLastRow() + 1;
   sh.getRange(row, 1, 1, def.fields.length).setNumberFormat('@').setValues([values]);
@@ -191,6 +247,7 @@ function update_(entity, id, data) {
   const merged = Object.assign({}, current, patch, { id: current.id, createdAt: current.createdAt });
   validate_(entity, merged);
   if (def.fields.indexOf('updatedAt') >= 0) merged.updatedAt = nowIso_();
+  if (entity === 'Shared') { merged.createdBy = current.createdBy; normalizeShared_(merged); }
   if (entity === 'Tasks') {
     if (merged.done && !current.done) merged.doneAt = nowIso_();
     if (!merged.done) merged.doneAt = '';
@@ -247,6 +304,354 @@ function toggleRoutine_(routineId, date) {
   return setRoutineLog_(routineId, date, !logs.length);
 }
 
+/* ───────────── 共同帳 ───────────── */
+
+function normalizeShared_(rec) {
+  const amt = Number(rec.amount) || 0;
+  if (rec.kind !== 'expense' || rec.payer === 'fund') { rec.split = ''; rec.otherShare = 0; return; }
+  if (['half', 'full', 'custom'].indexOf(rec.split) < 0) rec.split = 'half';
+  if (rec.split === 'half') rec.otherShare = Math.round(amt / 2 * 100) / 100;
+  else if (rec.split === 'full') rec.otherShare = amt;
+  else {
+    const o = Number(rec.otherShare);
+    if (!(o >= 0) || o > amt) throw new Error('自訂的分攤金額要在 0 到總額之間');
+    rec.otherShare = o;
+  }
+}
+
+function findShared_(id) {
+  const sh = sheet_('Shared');
+  const r = findRow_(sh, id);
+  return r ? fromRow_('Shared', sh.getRange(r, 1, 1, SCHEMA.Shared.fields.length).getValues()[0]) : null;
+}
+
+function names_() {
+  const p = PropertiesService.getScriptProperties();
+  return { ownerName: p.getProperty('OWNER_NAME') || '我', partnerName: p.getProperty('PARTNER_NAME') || '伴侶' };
+}
+
+function whoami_(role) { return Object.assign({ role: role }, names_()); }
+
+function shareConfig_(data) {
+  const p = PropertiesService.getScriptProperties();
+  if (data) {
+    if (data.ownerName !== undefined) p.setProperty('OWNER_NAME', String(data.ownerName).trim() || '我');
+    if (data.partnerName !== undefined) p.setProperty('PARTNER_NAME', String(data.partnerName).trim() || '伴侶');
+  }
+  const key = p.getProperty('LINE_WEBHOOK_KEY');
+  let url = '';
+  try { url = ScriptApp.getService().getUrl() || ''; } catch (e) { /* 編輯器以外可能取不到 */ }
+  return Object.assign(names_(), {
+    partnerToken: p.getProperty('PARTNER_TOKEN') || '',
+    line: {
+      configured: !!(p.getProperty('LINE_CHANNEL_TOKEN') && key),
+      groupBound: !!p.getProperty('LINE_GROUP_ID'),
+      partnerBound: !!p.getProperty('LINE_PARTNER_USER_ID'),
+      webhookUrl: key && url ? url + '?line=' + key : '',
+    },
+  });
+}
+
+function resetPartnerToken_() {
+  PropertiesService.getScriptProperties().setProperty('PARTNER_TOKEN', 'p' + Utilities.getUuid().replace(/-/g, ''));
+  return shareConfig_();
+}
+
+// 累計：伴侶欠你多少（正數＝伴侶要給你；負數＝你要給伴侶）
+function sharedBalance_() {
+  let owed = 0, fund = 0;
+  list_('Shared').forEach(function (r) {
+    const amt = Number(r.amount) || 0;
+    if (r.kind === 'expense') {
+      if (r.payer === 'me') owed += Number(r.otherShare) || 0;
+      else if (r.payer === 'partner') owed -= Number(r.otherShare) || 0;
+      else fund -= amt;
+    } else if (r.kind === 'settle') {
+      owed += r.payer === 'partner' ? -amt : amt;
+    } else if (r.kind === 'fund_in') fund += amt;
+  });
+  return { owed: Math.round(owed * 100) / 100, fund: Math.round(fund * 100) / 100 };
+}
+
+/* ───────────── LINE 群組機器人 ─────────────
+ * 設定：見 README「LINE 群組自動記帳」。指令碼屬性：LINE_CHANNEL_TOKEN（Channel access token）
+ * 在編輯器執行 setupLine() 取得 Webhook 網址。
+ */
+function setupLine() {
+  const p = PropertiesService.getScriptProperties();
+  if (!p.getProperty('LINE_WEBHOOK_KEY')) p.setProperty('LINE_WEBHOOK_KEY', Utilities.getUuid().replace(/-/g, ''));
+  if (!p.getProperty('LINE_CHANNEL_TOKEN')) Logger.log('⚠️ 還沒設定指令碼屬性 LINE_CHANNEL_TOKEN');
+  const url = ScriptApp.getService().getUrl();
+  Logger.log(url ? 'Webhook URL：' + url + '?line=' + p.getProperty('LINE_WEBHOOK_KEY')
+    : '請先「部署 → 網頁應用程式」，再執行一次 setupLine()');
+}
+
+/** 想重新綁定群組或張咘的 LINE 帳號時執行 */
+function resetLineBinding() {
+  const p = PropertiesService.getScriptProperties();
+  p.deleteProperty('LINE_GROUP_ID');
+  p.deleteProperty('LINE_PARTNER_USER_ID');
+  Logger.log('已清除綁定，請在群組重新傳「綁定記帳」和「我是' + names_().partnerName + '」');
+}
+
+const LINE_HELP = [
+  '記帳格式（一則可記多筆）：',
+  '・晚餐250　或　水果480 娃娃機70',
+  '・代付 果乾200 → 你全額幫她付，她要還全部',
+  '・基金 晚餐350 → 用共同基金付',
+  '・11/20 晚餐250 → 記在 11/20',
+  '指令：結算｜復原（刪掉你上一則記的）｜說明',
+].join('\n');
+
+function handleLine_(body) {
+  const p = PropertiesService.getScriptProperties();
+  (body.events || []).forEach(function (ev) {
+    try {
+      if (ev.type !== 'message' || !ev.message || ev.message.type !== 'text') return;
+      const text = String(ev.message.text || '').trim();
+      const src = ev.source || {};
+      const groupId = src.groupId || src.roomId || '';
+      const nm = names_();
+      if (text === '綁定記帳') {
+        if (!groupId) return lineReply_(ev.replyToken, '請在你們的記帳群組裡傳「綁定記帳」');
+        p.setProperty('LINE_GROUP_ID', groupId);
+        return lineReply_(ev.replyToken, '✅ 已綁定這個群組。接下來請' + nm.partnerName + '傳「我是' + nm.partnerName + '」');
+      }
+      const boundGroup = p.getProperty('LINE_GROUP_ID');
+      if (!boundGroup || groupId !== boundGroup) return; // 只處理綁定的群組
+      if (text === '我是' + nm.partnerName) {
+        p.setProperty('LINE_PARTNER_USER_ID', src.userId || '');
+        return lineReply_(ev.replyToken, '✅ 好的，' + nm.partnerName + '傳的金額會自動記到共同帳。\n' + LINE_HELP);
+      }
+      if (text === '說明' || text === '?' || text === '？') return lineReply_(ev.replyToken, LINE_HELP);
+      if (text === '結算') return lineReply_(ev.replyToken, balanceText_(nm));
+      if (!src.userId || src.userId !== p.getProperty('LINE_PARTNER_USER_ID')) return; // 只記張咘的訊息
+      if (text === '復原') return lineReply_(ev.replyToken, undoLine_());
+      const parsed = parseLineText_(text, lineDate_(ev.timestamp));
+      if (!parsed.items.length) return; // 沒有任何金額（例如聊天），不回覆
+      const msgId = String(ev.message.id || '');
+      const ids = withLock_(function () {
+        if (msgId && list_('Shared').some(function (r) { return r.lineMsgId === msgId; })) return null; // 重送的訊息
+        return parsed.items.map(function (it) {
+          return create_('Shared', { date: it.date, kind: 'expense', payer: it.fund ? 'fund' : 'partner', amount: it.amount,
+            split: it.full ? 'full' : 'half', note: it.name, category: '', createdBy: 'line', lineMsgId: msgId }).id;
+        });
+      });
+      if (!ids) return;
+      p.setProperty('LINE_LAST_BATCH', JSON.stringify(ids));
+      lineReply_(ev.replyToken, recordedText_(parsed, nm));
+    } catch (err) {
+      try { lineReply_(ev.replyToken, '⚠️ 記帳失敗：' + (err.message || err)); } catch (e2) { /* 忽略 */ }
+    }
+  });
+}
+
+function lineDate_(ms) {
+  return Utilities.formatDate(ms ? new Date(Number(ms)) : new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+}
+
+// 「水果480 娃娃機70 下午茶」→ 有金額的記下來，沒金額的列為缺漏
+function parseLineText_(text, today) {
+  let date = today;
+  let t = String(text).replace(/[０-９]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); });
+  const dm = t.match(/^\s*(?:(\d{4})[\/\.\-])?(\d{1,2})[\/\.\-](\d{1,2})\s+/);
+  if (dm) {
+    const y = dm[1] ? Number(dm[1]) : Number(today.slice(0, 4));
+    let d = y + '-' + ('0' + dm[2]).slice(-2) + '-' + ('0' + dm[3]).slice(-2);
+    if (!dm[1] && d > today) d = (y - 1) + d.slice(4); // 例如 1 月補記 12/30
+    date = d; t = t.slice(dm[0].length);
+  }
+  const allFull = /(^|\s)代付(\s|$)/.test(t), allFund = /(^|\s)基金(\s|$)/.test(t);
+  const tokens = t.replace(/(^|\s)(代付|基金)(?=\s|$)/g, ' ').split(/[\s,，、;；]+/).filter(Boolean);
+  const items = [], missing = [];
+  let pending = null;
+  let pendFlags = null;
+  tokens.forEach(function (raw) {
+    // 「果乾200(代付)」「代付果乾200」「基金晚餐350」：先把標記拿掉再讀金額
+    const flags = { full: /代付/.test(raw), fund: /^基金/.test(raw) };
+    const tok = raw.replace(/[\(（]?代付[\)）]?/g, '').replace(/^基金/, '').trim();
+    if (!tok) return;
+    const m = tok.match(/^(.*?)(\d+(?:\.\d+)?)(?:元|塊)?$/);
+    if (m && m[1] && !/^[\d\.\-\/]*$/.test(m[1])) { if (pending) missing.push(pending); pending = null; items.push(mkItem_(m[1], Number(m[2]), flags)); }
+    else if (m && !m[1] && pending) { items.push(mkItem_(pending, Number(m[2]), { full: flags.full || pendFlags.full, fund: flags.fund || pendFlags.fund })); pending = null; }
+    else if (!/\d/.test(tok)) { if (pending) missing.push(pending); pending = tok; pendFlags = flags; }
+  });
+  if (pending) missing.push(pending);
+  function mkItem_(name, amount, f) {
+    const n = name.replace(/[：:＝=]$/, '').trim();
+    return { name: n || '共同支出', amount: amount, date: date, full: allFull || f.full, fund: allFund || f.fund };
+  }
+  return { date: date, items: items.filter(function (i) { return i.amount > 0; }), missing: missing };
+}
+
+function recordedText_(parsed, nm) {
+  const its = parsed.items;
+  const total = its.reduce(function (s, i) { return s + i.amount; }, 0);
+  const owe = its.reduce(function (s, i) { return s + (i.fund ? 0 : i.full ? i.amount : i.amount / 2); }, 0);
+  const dateNote = parsed.date !== lineDate_() ? '（' + Number(parsed.date.slice(5, 7)) + '/' + Number(parsed.date.slice(8)) + '）' : '';
+  const lines = ['✅ 已記 ' + its.length + ' 筆' + dateNote + '：' + its.map(function (i) {
+    return i.name + ' ' + i.amount + (i.fund ? '（基金）' : i.full ? '（代付）' : '');
+  }).join('、')];
+  if (its.length > 1) lines.push('合計 ' + total);
+  if (owe) lines.push(nm.ownerName + '要給' + nm.partnerName + ' ' + fmtNum_(owe));
+  if (parsed.missing.length) lines.push('「' + parsed.missing.join('」「') + '」沒有金額，請補上，例如：' + parsed.missing[0] + ' 120');
+  const b = sharedBalance_();
+  lines.push(balanceLine_(b.owed, nm));
+  return lines.join('\n');
+}
+
+function balanceLine_(owed, nm) {
+  if (Math.abs(owed) < 1) return '目前累計：已結清 👍';
+  return '目前累計：' + (owed > 0 ? nm.partnerName + '要給' + nm.ownerName : nm.ownerName + '要給' + nm.partnerName) + ' ' + fmtNum_(Math.abs(owed));
+}
+
+function balanceText_(nm) {
+  const b = sharedBalance_();
+  return balanceLine_(b.owed, nm) + '\n共同基金餘額：' + fmtNum_(b.fund);
+}
+
+function fmtNum_(n) {
+  const r = Math.round(n * 100) / 100;
+  return String(r).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+function undoLine_() {
+  const p = PropertiesService.getScriptProperties();
+  let ids = [];
+  try { ids = JSON.parse(p.getProperty('LINE_LAST_BATCH') || '[]'); } catch (e) { ids = []; }
+  if (!ids.length) return '沒有可以復原的紀錄';
+  withLock_(function () { ids.forEach(function (id) { remove_('Shared', id); }); });
+  p.deleteProperty('LINE_LAST_BATCH');
+  return '↩️ 已刪除剛才記的 ' + ids.length + ' 筆\n' + balanceLine_(sharedBalance_().owed, names_());
+}
+
+function lineReply_(replyToken, text) {
+  const token = PropertiesService.getScriptProperties().getProperty('LINE_CHANNEL_TOKEN');
+  if (!token || !replyToken) return;
+  UrlFetchApp.fetch('https://api.line.me/v2/bot/message/reply', {
+    method: 'post', contentType: 'application/json', headers: { Authorization: 'Bearer ' + token },
+    payload: JSON.stringify({ replyToken: replyToken, messages: [{ type: 'text', text: String(text).slice(0, 4900) }] }),
+    muteHttpExceptions: true,
+  });
+}
+
+/* ───────────── 截圖辨識（Gemini） ─────────────
+ * 設定：Apps Script → 專案設定 → 指令碼屬性 → 新增 GEMINI_API_KEY（到 Google AI Studio 申請）
+ * 選用：GEMINI_MODEL 指定模型；沒設定時依序嘗試下面的模型，前一個不能用就換下一個。
+ */
+const GEMINI_MODELS = ['gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-flash-latest'];
+
+const STATEMENT_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    source: {
+      type: 'OBJECT',
+      properties: {
+        kind: { type: 'STRING', enum: ['credit_card', 'e_wallet', 'bank_account', 'unknown'] },
+        issuer: { type: 'STRING', nullable: true, description: '畫面上明確出現的銀行或錢包名稱；沒有明確文字就填 null，不要從商店名稱猜' },
+        appTitle: { type: 'STRING', nullable: true },
+        last4: { type: 'STRING', nullable: true },
+        evidence: { type: 'STRING', description: '判斷來源依據的畫面文字' },
+      },
+      required: ['kind', 'evidence'],
+    },
+    items: {
+      type: 'ARRAY',
+      items: {
+        type: 'OBJECT',
+        properties: {
+          year: { type: 'INTEGER', nullable: true },
+          month: { type: 'INTEGER', nullable: true },
+          day: { type: 'INTEGER', nullable: true },
+          merchant: { type: 'STRING' },
+          amount: { type: 'NUMBER', description: '一律填正數' },
+          direction: { type: 'STRING', enum: ['expense', 'fee', 'refund', 'income', 'topup', 'transfer_out'] },
+          counterparty: { type: 'STRING', nullable: true, description: '儲值來源銀行或轉帳對象' },
+          category: { type: 'STRING', description: '從提供的類別清單中選一個' },
+          installment: { type: 'STRING', nullable: true },
+          truncated: { type: 'BOOLEAN', description: '商店名稱在畫面上被截斷（有…）' },
+        },
+        required: ['merchant', 'amount', 'direction', 'category'],
+      },
+    },
+  },
+  required: ['source', 'items'],
+};
+
+function statementPrompt_(hint) {
+  hint = hint || {};
+  return [
+    (hint.isText ? '以下是使用者從台灣的信用卡、電子支付或網路銀行複製貼上的交易紀錄文字（排版可能亂掉，一筆交易可能分成好幾行）。' : '這是一張台灣的信用卡、電子支付或銀行 App 的交易紀錄截圖。')
+      + '請把「每一筆交易」都列出來，不要漏掉、不要自己編造。',
+    '規則：',
+    '1. 日期：依畫面上的日期（可能是每筆旁邊、或是上方的日期分組標題）。畫面沒有年份就 year 填 null；某筆上方的日期標題被截掉看不到，就 year/month/day 全部填 null。',
+    '2. 金額一律填正數，用 direction 表示性質：一般消費 expense；國外交易手續費／服務費 fee；退款、刷卡回饋、負數金額 refund；電子錢包從銀行儲值 topup（counterparty 填銀行名稱）；好友轉帳、轉出 transfer_out（counterparty 填對象）；其他入帳 income。',
+    '3. 「餘額 NT$xxx」是帳戶餘額，不是交易，不要列出。入帳起息日、末四碼、時間不是交易。',
+    '4. source.issuer 只填畫面上明確寫出的銀行或錢包名稱（例如標題「LINE Pay Money紀錄」→ LINE Pay）。畫面沒寫就填 null，不要從商店名稱推測。有「末四碼」就填 last4。',
+    '5. category 從這些類別選最接近的一個：' + (hint.expenseCats || []).join('、') + '；收入類：' + (hint.incomeCats || []).join('、') + '。',
+    '6. 商店名稱照畫面原文（全形字可轉半形、去掉多餘空白），被「…」截斷就 truncated=true。分期付款的「12/12期」填在 installment。',
+    '今天是 ' + (hint.today || '') + '。',
+  ].join('\n');
+}
+
+function parseStatement_(req) {
+  if (!req.image && !req.text) throw new Error('沒有收到圖片或文字');
+  if (req.text && String(req.text).length > 30000) throw new Error('文字太長，請分批貼上（一次 3 萬字以內）');
+  const props = PropertiesService.getScriptProperties();
+  const key = props.getProperty('GEMINI_API_KEY');
+  if (!key) throw new Error('尚未設定 Gemini API 金鑰：請到 Apps Script →「專案設定」→「指令碼屬性」新增 GEMINI_API_KEY');
+  const custom = props.getProperty('GEMINI_MODEL');
+  const models = custom ? [custom] : GEMINI_MODELS;
+  const body = {
+    contents: [{ role: 'user', parts: req.text
+      ? [{ text: statementPrompt_(Object.assign({}, req.hint, { isText: true })) + '\n\n──── 貼上的文字 ────\n' + req.text }]
+      : [{ inlineData: { mimeType: req.mimeType || 'image/jpeg', data: req.image } }, { text: statementPrompt_(req.hint) }] }],
+    generationConfig: { responseMimeType: 'application/json', responseSchema: STATEMENT_SCHEMA, temperature: 0 },
+  };
+  let lastErr = '';
+  for (let i = 0; i < models.length; i++) {
+    const res = UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/' + models[i] + ':generateContent', {
+      method: 'post', contentType: 'application/json', headers: { 'x-goog-api-key': key },
+      payload: JSON.stringify(body), muteHttpExceptions: true,
+    });
+    const code = res.getResponseCode();
+    let json = {};
+    try { json = JSON.parse(res.getContentText()); } catch (e) { /* 非 JSON 回應 */ }
+    if (code === 200) {
+      const cand = (json.candidates || [])[0];
+      const text = cand && cand.content && (cand.content.parts || []).map(function (p) { return p.text || ''; }).join('');
+      if (!text) throw new Error('Gemini 沒有回傳結果（' + ((cand && cand.finishReason) || '空白回應') + '），請換一張截圖再試');
+      const out = JSON.parse(text);
+      out.model = models[i];
+      return out;
+    }
+    const msg = (json.error && json.error.message) || ('HTTP ' + code);
+    if (code === 400 && /API key/i.test(msg)) throw new Error('Gemini API 金鑰無效，請確認 GEMINI_API_KEY');
+    if (code === 403) throw new Error('Gemini 拒絕存取（金鑰權限不足或未啟用）：' + msg);
+    lastErr = models[i] + '：' + msg;
+    // 404（模型不存在）或 429（額度用完）就換下一個模型
+    if (code !== 404 && code !== 429 && code !== 503) break;
+  }
+  throw new Error('Gemini 辨識失敗：' + lastErr);
+}
+
+/** 在編輯器執行一次：確認金鑰可用，並授權「連線到外部服務」 */
+function testGemini() {
+  const key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!key) throw new Error('請先在指令碼屬性新增 GEMINI_API_KEY');
+  const custom = PropertiesService.getScriptProperties().getProperty('GEMINI_MODEL');
+  const models = custom ? [custom] : GEMINI_MODELS;
+  for (let i = 0; i < models.length; i++) {
+    const res = UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/' + models[i] + ':generateContent', {
+      method: 'post', contentType: 'application/json', headers: { 'x-goog-api-key': key }, muteHttpExceptions: true,
+      payload: JSON.stringify({ contents: [{ parts: [{ text: '只回覆兩個字：成功' }] }] }),
+    });
+    Logger.log(models[i] + ' → HTTP ' + res.getResponseCode() + '：' + res.getContentText().slice(0, 200));
+    if (res.getResponseCode() === 200) { Logger.log('✅ Gemini 可以使用（模型 ' + models[i] + '）'); return; }
+  }
+  Logger.log('❌ 所有模型都失敗，請看上面的錯誤訊息');
+}
+
 /* ───────────── 工具函式 ───────────── */
 
 function findRow_(sh, id) {
@@ -287,6 +692,20 @@ function validate_(entity, rec) {
   }
   if (entity === 'Notes' && ['note', 'diary'].indexOf(rec.kind) < 0) {
     throw new Error('kind 必須是 note 或 diary');
+  }
+  if (entity === 'Shared') {
+    if (['expense', 'settle', 'fund_in'].indexOf(rec.kind) < 0) throw new Error('kind 必須是 expense、settle 或 fund_in');
+    if (['me', 'partner', 'fund'].indexOf(rec.payer) < 0) throw new Error('payer 必須是 me、partner 或 fund');
+    if (rec.payer === 'fund' && rec.kind !== 'expense') throw new Error('共同基金只能用來付支出');
+    if (!(Number(rec.amount) > 0)) throw new Error('金額要大於 0');
+  }
+  if (entity === 'Quick' && ['income', 'expense'].indexOf(rec.type) < 0) {
+    throw new Error('type 必須是 income 或 expense');
+  }
+  if (entity === 'Bills') {
+    if (['card', 'fixed'].indexOf(rec.kind) < 0) throw new Error('kind 必須是 card 或 fixed');
+    if (!(rec.dueDay >= 1 && rec.dueDay <= 31)) throw new Error('扣款日要在 1–31 之間');
+    if (rec.kind === 'card' && !(rec.closeDay >= 1 && rec.closeDay <= 31)) throw new Error('結帳日要在 1–31 之間');
   }
 }
 
