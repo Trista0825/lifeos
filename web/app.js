@@ -1,7 +1,7 @@
 /* LifeOS 前端 — 原生 JavaScript，不需要編譯 */
 'use strict';
 
-const APP_VERSION = '3.0.0';
+const APP_VERSION = '3.0.1';
 const ENTITIES = ['Transactions', 'Tasks', 'Events', 'Routines', 'RoutineLogs', 'Notes', 'Bills', 'Quick', 'Shared'];
 
 // 選項來自原本的記帳小程序；清單只是建議，輸入框仍可打清單以外的新值
@@ -2071,6 +2071,8 @@ function shareSettingsCard() {
     <button class="btn secondary" data-act="shareRetry">重試</button></div>`;
   const link = partnerLink(c);
   const L = c.line || {};
+  // Webhook 網址用 App 正在用的 /exec 網址組合，最不會錯
+  const hook = L.key && /\/exec$/.test(S.cfg.url) ? S.cfg.url + '?line=' + L.key : (L.webhookUrl || '');
   return `<div class="card"><h3>共同帳</h3>
     <div class="row2"><div class="field"><label>你的稱呼（給${esc(c.partnerName)}看的）</label><input id="cfgOwnerName" value="${esc(c.ownerName)}"></div>
       <div class="field"><label>伴侶的稱呼</label><input id="cfgPartnerName" value="${esc(c.partnerName)}"></div></div>
@@ -2086,8 +2088,23 @@ function shareSettingsCard() {
       <div><span>綁定群組</span><b class="${L.groupBound ? 'income' : 'muted'}">${L.groupBound ? '✓ 已綁定' : '在群組傳「綁定記帳」'}</b></div>
       <div><span>認出${esc(c.partnerName)}</span><b class="${L.partnerBound ? 'income' : 'muted'}">${L.partnerBound ? '✓ 已綁定' : `請他傳「我是${esc(c.partnerName)}」`}</b></div>
     </div>
-    ${L.webhookUrl ? `<div class="field" style="margin-top:10px"><label>Webhook URL（貼到 LINE Developers）</label><input id="webhookUrl" value="${esc(L.webhookUrl)}" readonly></div>` : '<p class="help">設定步驟見 README「LINE 群組自動記帳」。</p>'}
+    ${hook ? `<div class="field" style="margin-top:10px"><label>Webhook URL（整串貼到 LINE Developers，結尾要有 ?line=…）</label><input id="webhookUrl" value="${esc(hook)}" readonly></div>
+      <button class="btn secondary" data-act="copyWebhook">複製 Webhook URL</button>` : '<p class="help">設定步驟見 README「LINE 群組自動記帳」。</p>'}
+    <h3 style="margin-top:16px">最後收到的 LINE 訊息 <a data-act="shareRetry">重新整理 ↻</a></h3>
+    ${lineDiag(L)}
   </div>`;
+}
+function lineDiag(L) {
+  const h = L.lastHit;
+  if (!h || !h.at) {
+    return `<div class="alert warn" style="margin:0">還沒收到任何 LINE 訊息。代表 LINE 沒有把訊息送到這裡，請檢查：<br>
+      ① LINE Developers 的 Webhook URL 是不是上面那整串（結尾 <b>/exec?line=…</b>，不能是 /dev）<br>
+      ② 「Use webhook」有打開<br>③ 官方帳號的「回應設定」裡 Webhook 是開啟<br>④ 後端改完程式後有「部署 → 管理部署作業 → 編輯 → 新版本」</div>`;
+  }
+  const d = new Date(h.at);
+  const when = `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  if (!h.keyOk) return `<div class="alert warn" style="margin:0">${when} 收到了，但網址裡的密鑰不對（?line= 後面那串）。請重新複製上面的 Webhook URL 貼到 LINE Developers。</div>`;
+  return `<div class="diag"><div class="muted">${when}・${h.events} 個事件</div>${(h.steps || []).map(x => `<div>${esc(x)}</div>`).join('') || '<div class="muted">（沒有文字訊息）</div>'}</div>`;
 }
 function copyText(id) {
   const el = $('#' + id);
@@ -2127,6 +2144,7 @@ Object.assign(ACTIONS, {
     try { const r = await api({ action: 'resetPartnerToken' }); S.shareCfg = r.data; render(); } catch (err) { toast(err.message, true); }
   },
   copyPartnerLink: () => copyText('partnerLink'),
+  copyWebhook: () => copyText('webhookUrl'),
   shareRetry: () => { S.shareCfg = null; render(); },
 });
 document.addEventListener('change', e => {

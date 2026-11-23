@@ -1484,3 +1484,11 @@ body.partner .fab {
 .seg button {
   padding: 6px 10px;
 }
+
+.diag {
+  font-size: 13px;
+  line-height: 1.7;
+  background: var(--bg);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
