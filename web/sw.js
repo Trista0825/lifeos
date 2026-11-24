@@ -1,6 +1,6 @@
 // LifeOS Service Worker：快取 App 外殼，讓 App 可以離線開啟。
 // 每次更新前端檔案時，把 CACHE 的版本號 +1，使用者下次開啟就會拿到新版。
-const CACHE = 'lifeos-v13';
+const CACHE = 'lifeos-v16';
 const SHELL = [
   './',
   'index.html',

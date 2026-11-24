@@ -9,7 +9,7 @@
  *            → 部署 → 管理部署作業 → 編輯 → 新版本。
  */
 
-const APP_VERSION = '1.6.0';
+const APP_VERSION = '1.6.1';
 
 // 資料表定義：欄位順序 = 工作表欄位順序。
 // 新增欄位一律加在最後面，舊資料才不會錯位。
@@ -127,7 +127,9 @@ function doPost(e) {
     // LINE 群組機器人：網址帶 ?line=密鑰 才處理
     if (req.events && e.parameter && e.parameter.line) {
       const key = props.getProperty('LINE_WEBHOOK_KEY');
-      if (key && e.parameter.line === key) handleLine_(req);
+      const keyOk = !!key && e.parameter.line === key;
+      lineLog_({ at: new Date().toISOString(), keyOk: keyOk, events: (req.events || []).length, steps: [] }, true);
+      if (keyOk) handleLine_(req);
       return json_({ ok: true });
     }
     const owner = props.getProperty('API_TOKEN');
@@ -341,13 +343,18 @@ function shareConfig_(data) {
   const key = p.getProperty('LINE_WEBHOOK_KEY');
   let url = '';
   try { url = ScriptApp.getService().getUrl() || ''; } catch (e) { /* 編輯器以外可能取不到 */ }
+  let lastHit = null;
+  try { lastHit = JSON.parse(p.getProperty('LINE_LAST_HIT') || 'null'); } catch (e) { lastHit = null; }
   return Object.assign(names_(), {
     partnerToken: p.getProperty('PARTNER_TOKEN') || '',
     line: {
       configured: !!(p.getProperty('LINE_CHANNEL_TOKEN') && key),
+      hasToken: !!p.getProperty('LINE_CHANNEL_TOKEN'),
+      key: key || '',
       groupBound: !!p.getProperty('LINE_GROUP_ID'),
       partnerBound: !!p.getProperty('LINE_PARTNER_USER_ID'),
-      webhookUrl: key && url ? url + '?line=' + key : '',
+      webhookUrl: key && url && /\/exec$/.test(url) ? url + '?line=' + key : '',
+      lastHit: lastHit,
     },
   });
 }
@@ -382,8 +389,9 @@ function setupLine() {
   if (!p.getProperty('LINE_WEBHOOK_KEY')) p.setProperty('LINE_WEBHOOK_KEY', Utilities.getUuid().replace(/-/g, ''));
   if (!p.getProperty('LINE_CHANNEL_TOKEN')) Logger.log('⚠️ 還沒設定指令碼屬性 LINE_CHANNEL_TOKEN');
   const url = ScriptApp.getService().getUrl();
-  Logger.log(url ? 'Webhook URL：' + url + '?line=' + p.getProperty('LINE_WEBHOOK_KEY')
-    : '請先「部署 → 網頁應用程式」，再執行一次 setupLine()');
+  if (url && /\/exec$/.test(url)) Logger.log('Webhook URL：' + url + '?line=' + p.getProperty('LINE_WEBHOOK_KEY'));
+  else Logger.log('⚠️ 這裡取得的網址不是正式部署（/exec）網址。請改用 App「設定 → 共同帳」顯示的 Webhook URL，'
+    + '或自己組合：你在 App 設定的 Apps Script 網址（結尾 /exec）＋ ?line=' + p.getProperty('LINE_WEBHOOK_KEY'));
 }
 
 /** 想重新綁定群組或張咘的 LINE 帳號時執行 */
@@ -407,28 +415,32 @@ function handleLine_(body) {
   const p = PropertiesService.getScriptProperties();
   (body.events || []).forEach(function (ev) {
     try {
-      if (ev.type !== 'message' || !ev.message || ev.message.type !== 'text') return;
+      if (ev.type !== 'message' || !ev.message || ev.message.type !== 'text') { lineStep_(ev.type + '（不是文字訊息，略過）'); return; }
       const text = String(ev.message.text || '').trim();
       const src = ev.source || {};
       const groupId = src.groupId || src.roomId || '';
       const nm = names_();
+      lineStep_('收到「' + text.slice(0, 30) + '」' + (groupId ? '' : '（不是在群組裡）'));
       if (text === '綁定記帳') {
         if (!groupId) return lineReply_(ev.replyToken, '請在你們的記帳群組裡傳「綁定記帳」');
         p.setProperty('LINE_GROUP_ID', groupId);
         return lineReply_(ev.replyToken, '✅ 已綁定這個群組。接下來請' + nm.partnerName + '傳「我是' + nm.partnerName + '」');
       }
       const boundGroup = p.getProperty('LINE_GROUP_ID');
-      if (!boundGroup || groupId !== boundGroup) return; // 只處理綁定的群組
+      if (!boundGroup || groupId !== boundGroup) { lineStep_(boundGroup ? '不是綁定的群組，略過' : '還沒綁定群組（請先傳「綁定記帳」）'); return; } // 只處理綁定的群組
       if (text === '我是' + nm.partnerName) {
         p.setProperty('LINE_PARTNER_USER_ID', src.userId || '');
         return lineReply_(ev.replyToken, '✅ 好的，' + nm.partnerName + '傳的金額會自動記到共同帳。\n' + LINE_HELP);
       }
       if (text === '說明' || text === '?' || text === '？') return lineReply_(ev.replyToken, LINE_HELP);
       if (text === '結算') return lineReply_(ev.replyToken, balanceText_(nm));
-      if (!src.userId || src.userId !== p.getProperty('LINE_PARTNER_USER_ID')) return; // 只記張咘的訊息
+      if (!src.userId || src.userId !== p.getProperty('LINE_PARTNER_USER_ID')) {
+        lineStep_(p.getProperty('LINE_PARTNER_USER_ID') ? '不是' + nm.partnerName + '傳的，不記' : '還沒認出' + nm.partnerName + '（請他傳「我是' + nm.partnerName + '」）');
+        return;
+      } // 只記張咘的訊息
       if (text === '復原') return lineReply_(ev.replyToken, undoLine_());
       const parsed = parseLineText_(text, lineDate_(ev.timestamp));
-      if (!parsed.items.length) return; // 沒有任何金額（例如聊天），不回覆
+      if (!parsed.items.length) { lineStep_('沒有找到金額，不記'); return; } // 沒有任何金額（例如聊天），不回覆
       const msgId = String(ev.message.id || '');
       const ids = withLock_(function () {
         if (msgId && list_('Shared').some(function (r) { return r.lineMsgId === msgId; })) return null; // 重送的訊息
@@ -437,10 +449,12 @@ function handleLine_(body) {
             split: it.full ? 'full' : 'half', note: it.name, category: '', createdBy: 'line', lineMsgId: msgId }).id;
         });
       });
-      if (!ids) return;
+      if (!ids) { lineStep_('重複的訊息，略過'); return; }
+      lineStep_('✅ 記了 ' + ids.length + ' 筆');
       p.setProperty('LINE_LAST_BATCH', JSON.stringify(ids));
       lineReply_(ev.replyToken, recordedText_(parsed, nm));
     } catch (err) {
+      lineStep_('❌ 錯誤：' + (err.message || err));
       try { lineReply_(ev.replyToken, '⚠️ 記帳失敗：' + (err.message || err)); } catch (e2) { /* 忽略 */ }
     }
   });
@@ -527,12 +541,37 @@ function undoLine_() {
 
 function lineReply_(replyToken, text) {
   const token = PropertiesService.getScriptProperties().getProperty('LINE_CHANNEL_TOKEN');
-  if (!token || !replyToken) return;
-  UrlFetchApp.fetch('https://api.line.me/v2/bot/message/reply', {
-    method: 'post', contentType: 'application/json', headers: { Authorization: 'Bearer ' + token },
-    payload: JSON.stringify({ replyToken: replyToken, messages: [{ type: 'text', text: String(text).slice(0, 4900) }] }),
-    muteHttpExceptions: true,
-  });
+  if (!token) { lineStep_('❌ 沒有設定 LINE_CHANNEL_TOKEN，無法回覆'); return; }
+  if (!replyToken) return;
+  let res;
+  try {
+    res = UrlFetchApp.fetch('https://api.line.me/v2/bot/message/reply', {
+      method: 'post', contentType: 'application/json', headers: { Authorization: 'Bearer ' + token },
+      payload: JSON.stringify({ replyToken: replyToken, messages: [{ type: 'text', text: String(text).slice(0, 4900) }] }),
+      muteHttpExceptions: true,
+    });
+  } catch (err) {
+    lineStep_('❌ 回覆失敗（Apps Script 可能還沒授權連線到外部服務，請在編輯器執行一次 setupLine）：' + (err.message || err));
+    return;
+  }
+  const code = res.getResponseCode();
+  if (code === 200) lineStep_('已回覆');
+  else lineStep_('❌ LINE 拒絕回覆（HTTP ' + code + '）：' + res.getContentText().slice(0, 120) + (code === 401 ? ' → Channel access token 錯誤' : ''));
+}
+
+// 診斷：記下最後一次收到 LINE webhook 的處理過程，App 設定頁會顯示
+function lineLog_(obj, reset) {
+  const p = PropertiesService.getScriptProperties();
+  let cur = {};
+  if (!reset) { try { cur = JSON.parse(p.getProperty('LINE_LAST_HIT') || '{}'); } catch (e) { cur = {}; } }
+  p.setProperty('LINE_LAST_HIT', JSON.stringify(Object.assign(cur, obj)).slice(0, 8000));
+}
+function lineStep_(msg) {
+  const p = PropertiesService.getScriptProperties();
+  let cur = {};
+  try { cur = JSON.parse(p.getProperty('LINE_LAST_HIT') || '{}'); } catch (e) { cur = {}; }
+  cur.steps = (cur.steps || []).concat([msg]).slice(-12);
+  p.setProperty('LINE_LAST_HIT', JSON.stringify(cur).slice(0, 8000));
 }
 
 /* ───────────── 截圖辨識（Gemini） ─────────────

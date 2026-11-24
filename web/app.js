@@ -33,7 +33,7 @@ const FUND_CAT = '共同基金';     // 你存進共同基金的錢（個人帳�
 const REIMB_IN_CAT = '代墊收回'; // 同事還你代墊的錢
 // 這些收入其實是「別人還你的錢」，總覽會從支出扣掉、不算收入
 const REIMB_CATS = [REIMB_IN_CAT, SETTLE_CAT, '其他收入(代付)'];
-const MIGRATE_FROM = '2026-08-01'; // 舊的「(共同)」從這天開始轉進共同帳
+const MIGRATE_FROM = '2026-07-01'; // 舊的「(共同)」從這天開始轉進共同帳
 const QUICK_MAX = 12;        // 常用按鈕最多幾個（釘選的先排，再用歷史紀錄補）
 const QUICK_HISTORY = 1500;  // 統計常用按鈕時往回看幾筆
 
